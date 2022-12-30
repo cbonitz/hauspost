@@ -5,7 +5,8 @@ use std::{
 
 use debug_ignore::DebugIgnore;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{event, info, span, warn, Level};
+use uuid::Uuid;
 
 pub trait Message: Send + 'static {}
 impl<T> Message for T where T: Send + 'static {}
@@ -36,6 +37,7 @@ struct RequestReceive<T>
 where
     T: Message,
 {
+    id: Uuid,
     response_sender: DebugIgnore<oneshot::Sender<RecieveStatus<T>>>,
     queue: String,
 }
@@ -43,7 +45,8 @@ where
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendStatus {
     InternalError,
-    Sent,
+    Received,
+    Enqueued,
 }
 
 #[derive(Debug)]
@@ -51,7 +54,8 @@ struct SendMessage<T>
 where
     T: Message,
 {
-    response_sender: DebugIgnore<oneshot::Sender<SendStatus>>,
+    id: Uuid,
+    response_sender: DebugIgnore<Option<oneshot::Sender<SendStatus>>>,
     message: DebugIgnore<T>,
     queue: String,
 }
@@ -64,21 +68,14 @@ where
     Receive(RequestReceive<T>),
     Send(SendMessage<T>),
 }
-
-#[derive(Debug)]
-struct IdentifiedRequest<T> {
-    id: u64,
-    request: T,
-}
 pub struct MessageExchange<T>
 where
     T: Message,
 {
-    sequence_number: u64,
-    request_queues: HashMap<String, LinkedList<u64>>,
-    requests_by_sequence_number: HashMap<u64, IdentifiedRequest<RequestReceive<T>>>,
-    message_queues: HashMap<String, LinkedList<u64>>,
-    messages_by_sequence_number: HashMap<u64, IdentifiedRequest<SendMessage<T>>>,
+    request_queues: HashMap<String, LinkedList<Uuid>>,
+    requests_by_sequence_number: HashMap<Uuid, RequestReceive<T>>,
+    message_queues: HashMap<String, LinkedList<Uuid>>,
+    messages_by_sequence_number: HashMap<Uuid, SendMessage<T>>,
     request_receiver: mpsc::UnboundedReceiver<Request<T>>,
 }
 
@@ -91,7 +88,6 @@ where
         (
             MessageExchangeConnection { request_sender },
             Self {
-                sequence_number: 0,
                 request_queues: HashMap::new(),
                 requests_by_sequence_number: HashMap::new(),
                 message_queues: HashMap::new(),
@@ -101,10 +97,10 @@ where
         )
     }
 
-    #[tracing::instrument(skip(self, request), fields(request_id = %request.id, queue=%request.request.queue))]
-    async fn receive(&mut self, request: IdentifiedRequest<RequestReceive<T>>) {
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.id, queue=%request.queue))]
+    async fn receive(&mut self, request: RequestReceive<T>) {
         info!("Receive request {}", request.id);
-        let queue = request.request.queue.clone();
+        let queue = request.queue.clone();
         match self.request_queues.get_mut(queue.as_str()) {
             Some(queue) => queue.push_back(request.id),
             None => {
@@ -117,10 +113,10 @@ where
         self.make_matches(&queue).await;
     }
 
-    #[tracing::instrument(skip(self, message),fields(message_id = %message.id, queue=%message.request.queue))]
-    async fn send(&mut self, message: IdentifiedRequest<SendMessage<T>>) {
+    #[tracing::instrument(skip(self, message),fields(message_id = %message.id, queue=%message.queue))]
+    async fn send(&mut self, message: SendMessage<T>) {
         info!("Send request {}", message.id);
-        let queue = message.request.queue.clone();
+        let queue = message.queue.clone();
         match self.message_queues.get_mut(queue.as_str()) {
             Some(queue) => queue.push_back(message.id),
             None => {
@@ -134,39 +130,26 @@ where
     }
 
     #[tracing::instrument(skip(request, message), fields(request_id = %request.id, message_id=%message.id))]
-    async fn process_match(
-        request: IdentifiedRequest<RequestReceive<T>>,
-        message: IdentifiedRequest<SendMessage<T>>,
-    ) {
-        info!("Processing match");
+    async fn process_match(request: RequestReceive<T>, message: SendMessage<T>) {
         match request
-            .request
             .response_sender
             .0
-            .send(RecieveStatus::Received(message.request.message.0))
+            .send(RecieveStatus::Received(message.message.0))
         {
             Ok(()) => {
-                if message
-                    .request
-                    .response_sender
-                    .0
-                    .send(SendStatus::Sent)
-                    .is_err()
-                {
-                    warn!("Error sending success result");
-                };
+                message.response_sender.0.map(|sender| {
+                    if sender.send(SendStatus::Received).is_err() {
+                        warn!("Error sending success result");
+                    }
+                });
             }
             Err(_) => {
                 warn!("Error sending message");
-                if message
-                    .request
-                    .response_sender
-                    .0
-                    .send(SendStatus::InternalError)
-                    .is_err()
-                {
-                    warn!("Error sending error result");
-                };
+                message.response_sender.0.map(|sender| {
+                    if sender.send(SendStatus::InternalError).is_err() {
+                        warn!("Error sending error result");
+                    }
+                });
             }
         }
     }
@@ -178,7 +161,6 @@ where
             let message_queue = self.message_queues.get_mut(queue);
             match (request_queue, message_queue) {
                 (Some(request_queue), Some(message_queue)) => {
-                    info!("match");
                     let request_id = request_queue
                         .pop_front()
                         .expect("No empty request queue should ever be in requests map");
@@ -211,11 +193,9 @@ where
 
     async fn process_request(&mut self, request: Request<T>) {
         info!("Received request");
-        let id = self.sequence_number;
-        self.sequence_number += 1;
         match request {
-            Request::Receive(request) => self.receive(IdentifiedRequest { id, request }).await,
-            Request::Send(request) => self.send(IdentifiedRequest { id, request }).await,
+            Request::Receive(request) => self.receive(request).await,
+            Request::Send(message) => self.send(message).await,
         };
     }
 
@@ -245,57 +225,77 @@ impl<T> MessageExchangeConnection<T>
 where
     T: Message,
 {
-    #[tracing::instrument(skip(self, message))]
-    pub async fn send_message(&self, message: T, queue: String) -> SendStatus {
-        info!("Sending message");
-        let (response_sender, receiver) = oneshot::channel();
+    pub async fn send_message(&self, message: T, queue: String, block: bool) -> SendStatus {
+        let (response_sender, receiver) = if block {
+            let (response_sender, receiver) = oneshot::channel();
+            (Some(response_sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let id = Uuid::new_v4();
+        let span = span!(
+            Level::INFO,
+            "send_message",
+            queue = queue,
+            message_id = id.to_string()
+        );
+        let _guard = span.enter();
         let message = Request::Send(SendMessage {
+            id,
             response_sender: DebugIgnore(response_sender),
             message: DebugIgnore(message),
             queue,
         });
-        match self.request_sender.send(message) {
-            Ok(()) => {
-                info!("Sender waiting");
-                match receiver.await {
+        let result = match self.request_sender.send(message) {
+            Ok(()) => match receiver {
+                Some(receiver) => match receiver.await {
                     Ok(status) => status,
                     Err(_) => SendStatus::InternalError,
-                }
-            }
+                },
+                None => SendStatus::Enqueued,
+            },
             Err(_) => SendStatus::InternalError,
-        }
+        };
+        event!(Level::INFO, result = ?result);
+        result
     }
 
-    #[tracing::instrument(skip(self))]
     pub async fn receive_message(&self, queue: String) -> RecieveStatus<T> {
-        info!("Receiving message");
         let (response_sender, receiver) = oneshot::channel();
+        let id = Uuid::new_v4();
+        let span = span!(
+            Level::INFO,
+            "receive_message",
+            queue = queue,
+            message_id = id.to_string()
+        );
+        let _guard = span.enter();
         let request = Request::Receive(RequestReceive {
+            id,
             response_sender: DebugIgnore(response_sender),
             queue,
         });
-        match self.request_sender.send(request) {
-            Ok(()) => {
-                info!("Receiver waiting");
-                match receiver.await {
-                    Ok(status) => status,
-                    Err(_) => {
-                        warn!("Receive failed (result sender dropped)");
-                        RecieveStatus::InternalError
-                    }
+        let result = match self.request_sender.send(request) {
+            Ok(()) => match receiver.await {
+                Ok(status) => status,
+                Err(_) => {
+                    warn!("Receive failed (result sender dropped)");
+                    RecieveStatus::InternalError
                 }
-            }
+            },
             Err(_) => {
                 warn!("Send failed");
                 RecieveStatus::InternalError
             }
-        }
+        };
+        event!(Level::INFO, result = ?result);
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
+    use std::{env, sync::Once};
 
     use tracing_subscriber::fmt::format::FmtSpan;
 
@@ -304,11 +304,15 @@ mod tests {
     static INITIALIZE_LOGGER: Once = Once::new();
 
     fn initialize_logger() {
-        INITIALIZE_LOGGER.call_once(|| {
-            tracing_subscriber::fmt()
-                .with_span_events(FmtSpan::ACTIVE)
-                .init();
-        });
+        if let Ok(val) = env::var("TRACE_TESTS") {
+            if val == "1" {
+                INITIALIZE_LOGGER.call_once(|| {
+                    tracing_subscriber::fmt()
+                        .with_span_events(FmtSpan::ACTIVE)
+                        .init();
+                });
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -321,12 +325,80 @@ mod tests {
         let send_connection = connection.clone();
         tokio::spawn(async move {
             send_connection
-                .send_message("hello, world".to_string(), "greetings".to_string())
+                .send_message("hello, world".to_string(), "greetings".to_string(), true)
                 .await;
         });
         assert_eq!(
             connection.receive_message("greetings".to_string()).await,
             RecieveStatus::Received("hello, world".to_string())
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_receive_multiple() {
+        initialize_logger();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+        let send_connection = connection.clone();
+        tokio::spawn(async move {
+            for i in 1..2 {
+                send_connection
+                    .send_message(format!("Hello, {}", i), "greetings".to_string(), true)
+                    .await;
+            }
+            for i in 1..2 {
+                send_connection
+                    .send_message(format!("Goodbye, {}", i), "farewells".to_string(), true)
+                    .await;
+            }
+        });
+        for i in 1..2 {
+            assert_eq!(
+                connection.receive_message("greetings".to_string()).await,
+                RecieveStatus::Received(format!("Hello, {}", i))
+            )
+        }
+        for i in 1..2 {
+            assert_eq!(
+                connection.receive_message("farewells".to_string()).await,
+                RecieveStatus::Received(format!("Goodbye, {}", i))
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_receive_multiple_nonblocking() {
+        initialize_logger();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+        let send_connection = connection.clone();
+        tokio::spawn(async move {
+            for i in 1..2 {
+                send_connection
+                    .send_message(format!("Goodbye, {}", i), "farewells".to_string(), false)
+                    .await;
+            }
+            for i in 1..2 {
+                send_connection
+                    .send_message(format!("Hello, {}", i), "greetings".to_string(), false)
+                    .await;
+            }
+        });
+        for i in 1..2 {
+            assert_eq!(
+                connection.receive_message("greetings".to_string()).await,
+                RecieveStatus::Received(format!("Hello, {}", i))
+            )
+        }
+        for i in 1..2 {
+            assert_eq!(
+                connection.receive_message("farewells".to_string()).await,
+                RecieveStatus::Received(format!("Goodbye, {}", i))
+            )
+        }
     }
 }
