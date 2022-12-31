@@ -23,6 +23,7 @@ where
 {
     InternalError,
     Received(T),
+    Timeout,
 }
 
 impl<T> fmt::Debug for RecieveStatus<T>
@@ -33,6 +34,7 @@ where
         match self {
             Self::InternalError => write!(f, "InternalError"),
             Self::Received(_) => f.debug_tuple("Received").finish(),
+            Self::Timeout => write!(f, "Timeout"),
         }
     }
 }
@@ -40,6 +42,7 @@ where
 #[derive(Debug)]
 struct TimeoutStamp {
     timeout_at: Instant,
+    created_at: Instant,
 }
 
 impl TimeoutStamp {
@@ -47,6 +50,7 @@ impl TimeoutStamp {
         let created_at = Instant::now();
         Self {
             timeout_at: created_at + timeout_duration,
+            created_at,
         }
     }
 }
@@ -57,9 +61,27 @@ where
     T: Message,
 {
     id: Uuid,
-    response_sender: DebugIgnore<oneshot::Sender<RecieveStatus<T>>>,
+    response_sender: DebugIgnore<Option<oneshot::Sender<RecieveStatus<T>>>>,
     queue: String,
     timeout: TimeoutStamp,
+}
+
+impl<T> RequestReceive<T>
+where
+    T: Message,
+{
+    #[tracing::instrument(skip(self), fields(request_id = %self.id))]
+    pub fn reply(&mut self, status: RecieveStatus<T>) {
+        if let Some(sender) = self.response_sender.0.take() {
+            match sender.send(status) {
+                Ok(_) => {}
+                Err(_) => warn!(
+                    message_id = self.id.to_string(),
+                    "Failed to send send status",
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +89,7 @@ pub enum SendStatus {
     InternalError,
     Received,
     Enqueued,
+    Timeout,
 }
 
 #[derive(Debug)]
@@ -79,6 +102,24 @@ where
     message: DebugIgnore<T>,
     queue: String,
     timeout: TimeoutStamp,
+}
+
+impl<T> SendMessage<T>
+where
+    T: Message,
+{
+    #[tracing::instrument(skip(self), fields(message_id = %self.id))]
+    pub fn reply(&mut self, status: SendStatus) {
+        if let Some(sender) = self.response_sender.0.take() {
+            match sender.send(status) {
+                Ok(_) => {}
+                Err(_) => warn!(
+                    message_id = self.id.to_string(),
+                    "Failed to send send status",
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,30 +205,12 @@ where
     }
 
     #[tracing::instrument(skip(request, message), fields(request_id = %request.id, message_id=%message.id))]
-    async fn process_match(request: RequestReceive<T>, message: SendMessage<T>) {
-        match request
-            .response_sender
-            .0
-            .send(RecieveStatus::Received(message.message.0))
-        {
-            Ok(()) => {
-                message.response_sender.0.map(|sender| {
-                    if sender.send(SendStatus::Received).is_err() {
-                        warn!("Error sending success result");
-                    }
-                });
-            }
-            Err(_) => {
-                warn!("Error sending message");
-                message.response_sender.0.map(|sender| {
-                    if sender.send(SendStatus::InternalError).is_err() {
-                        warn!("Error sending error result");
-                    }
-                });
-            }
-        }
+    async fn process_match(mut request: RequestReceive<T>, mut message: SendMessage<T>) {
+        message.reply(SendStatus::Received);
+        request.reply(RecieveStatus::Received(message.message.0));
     }
 
+    #[tracing::instrument(skip(self))]
     fn pop_timed_out(&mut self, queue: &str) {
         let request_queue = self.request_queues.get_mut(queue);
         let mut remove_request_queue = false;
@@ -206,6 +229,7 @@ where
                 }
                 if request_queue.is_empty() {
                     remove_request_queue = true;
+                    break;
                 }
             }
         }
@@ -229,6 +253,7 @@ where
                 }
                 if message_queue.is_empty() {
                     remove_message_queue = true;
+                    break;
                 }
             }
         }
@@ -286,7 +311,9 @@ where
             if timed_out {
                 let Reverse((_, id)) = self.message_timeouts.pop().unwrap();
                 event!(Level::INFO, message_id = id.to_string(), "message_timeout");
-                self.messages_by_sequence_number.remove(&id);
+                if let Some(mut message) = self.messages_by_sequence_number.remove(&id) {
+                    message.reply(SendStatus::Timeout)
+                }
             } else {
                 break;
             }
@@ -300,7 +327,9 @@ where
             if timed_out {
                 let Reverse((_, id)) = self.request_timeouts.pop().unwrap();
                 event!(Level::INFO, request_id = id.to_string(), "request_timeout");
-                self.requests_by_sequence_number.remove(&id);
+                if let Some(mut sender) = self.requests_by_sequence_number.remove(&id) {
+                    sender.reply(RecieveStatus::Timeout)
+                }
             } else {
                 break;
             }
@@ -310,8 +339,14 @@ where
     async fn process_request(&mut self, request: Request<T>) {
         info!("Received request");
         match request {
-            Request::Receive(request) => self.receive(request).await,
-            Request::Send(message) => self.send(message).await,
+            Request::Receive(request) => {
+                self.process_timeout_at(request.timeout.created_at).await;
+                self.receive(request).await
+            }
+            Request::Send(message) => {
+                self.process_timeout_at(message.timeout.created_at).await;
+                self.send(message).await
+            }
         };
     }
 
@@ -427,7 +462,7 @@ where
         let _guard = span.enter();
         let request = Request::Receive(RequestReceive {
             id,
-            response_sender: DebugIgnore(response_sender),
+            response_sender: DebugIgnore(Some(response_sender)),
             queue,
             timeout: TimeoutStamp::new(min(
                 timeout.unwrap_or(Self::DEFAULT_TIMEOUT),
@@ -544,6 +579,37 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_receive_large_amount() {
+        initialize_logger();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+        let count = 10_000;
+        let send_connection = connection.clone();
+        tokio::spawn(async move {
+            for i in 1..count {
+                send_connection
+                    .send_message(
+                        format!("message {}", i),
+                        format!("messages {}", i % 10),
+                        false,
+                        None,
+                    )
+                    .await;
+            }
+        });
+        for i in 1..count {
+            assert_eq!(
+                connection
+                    .receive_message(format!("messages {}", i % 10), None)
+                    .await,
+                RecieveStatus::Received(format!("message {}", i))
+            )
+        }
+    }
+
     #[tokio::test]
     async fn test_send_receive_multiple_nonblocking() {
         initialize_logger();
@@ -593,6 +659,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_timeout_status_send() {
+        initialize_logger();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+
+        let send_result = tokio::spawn(async move {
+            connection
+                .send_message(
+                    "forget".to_string(),
+                    "queue".to_string(),
+                    true,
+                    Some(Duration::from_millis(1)),
+                )
+                .await
+        });
+        assert_eq!(send_result.await.unwrap(), SendStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_status_receive() {
+        initialize_logger();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+
+        let receive_result = tokio::spawn(async move {
+            connection
+                .receive_message("queue".to_string(), Some(Duration::from_millis(1)))
+                .await
+        });
+        assert_eq!(receive_result.await.unwrap(), RecieveStatus::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_status_send_receive() {
+        initialize_logger();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+        let send_connection = connection.clone();
+        let send_result = tokio::spawn(async move {
+            send_connection
+                .send_message(
+                    "forget".to_string(),
+                    "queue".to_string(),
+                    true,
+                    Some(Duration::from_millis(1)),
+                )
+                .await
+        });
+        assert_eq!(send_result.await.unwrap(), SendStatus::Timeout);
+
+        let receive_result = tokio::spawn(async move {
+            connection
+                .receive_message("queue".to_string(), Some(Duration::from_millis(10)))
+                .await
+        });
+        assert_eq!(receive_result.await.unwrap(), RecieveStatus::Timeout);
+    }
+
+    #[tokio::test]
     async fn test_send_timeout() {
         initialize_logger();
         time::pause();
@@ -621,5 +752,42 @@ mod tests {
             connection.receive_message("queue".to_string(), None).await,
             RecieveStatus::Received("remember".to_string())
         )
+    }
+
+    #[tokio::test]
+    async fn test_send_timeout_multiple() {
+        initialize_logger();
+        time::pause();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+        for _ in 1..5_000 {
+            connection
+                .send_message(
+                    "forget".to_string(),
+                    "queue".to_string(),
+                    false,
+                    Some(Duration::from_secs(1)),
+                )
+                .await;
+        }
+        for _ in 1..5_000 {
+            connection
+                .send_message(
+                    "remember".to_string(),
+                    "queue".to_string(),
+                    false,
+                    Some(Duration::from_secs(3)),
+                )
+                .await;
+        }
+        time::advance(Duration::from_secs(2)).await;
+        for _ in 1..5_000 {
+            assert_eq!(
+                connection.receive_message("queue".to_string(), None).await,
+                RecieveStatus::Received("remember".to_string())
+            )
+        }
     }
 }
