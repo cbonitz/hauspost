@@ -1,10 +1,15 @@
 use std::{
-    collections::{HashMap, LinkedList},
+    cmp::{min, Reverse},
+    collections::{BinaryHeap, HashMap, LinkedList},
     fmt,
+    time::Duration,
 };
 
 use debug_ignore::DebugIgnore;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::{sleep, Instant},
+};
 use tracing::{event, info, span, warn, Level};
 use uuid::Uuid;
 
@@ -33,6 +38,20 @@ where
 }
 
 #[derive(Debug)]
+struct TimeoutStamp {
+    timeout_at: Instant,
+}
+
+impl TimeoutStamp {
+    pub fn new(timeout_duration: Duration) -> Self {
+        let created_at = Instant::now();
+        Self {
+            timeout_at: created_at + timeout_duration,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct RequestReceive<T>
 where
     T: Message,
@@ -40,6 +59,7 @@ where
     id: Uuid,
     response_sender: DebugIgnore<oneshot::Sender<RecieveStatus<T>>>,
     queue: String,
+    timeout: TimeoutStamp,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +78,7 @@ where
     response_sender: DebugIgnore<Option<oneshot::Sender<SendStatus>>>,
     message: DebugIgnore<T>,
     queue: String,
+    timeout: TimeoutStamp,
 }
 
 #[derive(Debug)]
@@ -73,10 +94,14 @@ where
     T: Message,
 {
     request_queues: HashMap<String, LinkedList<Uuid>>,
+    request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
     requests_by_sequence_number: HashMap<Uuid, RequestReceive<T>>,
     message_queues: HashMap<String, LinkedList<Uuid>>,
+    message_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
     messages_by_sequence_number: HashMap<Uuid, SendMessage<T>>,
     request_receiver: mpsc::UnboundedReceiver<Request<T>>,
+    tick_sender: mpsc::UnboundedSender<Instant>,
+    tick_receiver: Option<mpsc::UnboundedReceiver<Instant>>,
 }
 
 impl<T> MessageExchange<T>
@@ -85,14 +110,19 @@ where
 {
     pub fn new() -> (MessageExchangeConnection<T>, Self) {
         let (request_sender, request_receiver) = mpsc::unbounded_channel();
+        let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
         (
             MessageExchangeConnection { request_sender },
             Self {
                 request_queues: HashMap::new(),
+                request_timeouts: BinaryHeap::new(),
                 requests_by_sequence_number: HashMap::new(),
                 message_queues: HashMap::new(),
+                message_timeouts: BinaryHeap::new(),
                 messages_by_sequence_number: HashMap::new(),
                 request_receiver,
+                tick_sender,
+                tick_receiver: Some(tick_receiver),
             },
         )
     }
@@ -109,6 +139,8 @@ where
                 ()
             }
         }
+        self.request_timeouts
+            .push(Reverse((request.timeout.timeout_at, request.id.clone())));
         self.requests_by_sequence_number.insert(request.id, request);
         self.make_matches(&queue).await;
     }
@@ -125,6 +157,8 @@ where
                 ()
             }
         }
+        self.message_timeouts
+            .push(Reverse((message.timeout.timeout_at, message.id.clone())));
         self.messages_by_sequence_number.insert(message.id, message);
         self.make_matches(queue.as_str()).await;
     }
@@ -154,9 +188,59 @@ where
         }
     }
 
+    fn pop_timed_out(&mut self, queue: &str) {
+        let request_queue = self.request_queues.get_mut(queue);
+        let mut remove_request_queue = false;
+        if let Some(request_queue) = request_queue {
+            loop {
+                let front = request_queue.front();
+                match front {
+                    Some(elem) => {
+                        if !self.requests_by_sequence_number.contains_key(elem) {
+                            request_queue.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+                if request_queue.is_empty() {
+                    remove_request_queue = true;
+                }
+            }
+        }
+        if remove_request_queue {
+            self.request_queues.remove(queue);
+        }
+        let message_queue = self.message_queues.get_mut(queue);
+        let mut remove_message_queue = false;
+        if let Some(message_queue) = message_queue {
+            loop {
+                let front = message_queue.front();
+                match front {
+                    Some(elem) => {
+                        if !self.messages_by_sequence_number.contains_key(elem) {
+                            message_queue.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {}
+                }
+                if message_queue.is_empty() {
+                    remove_message_queue = true;
+                }
+            }
+        }
+        if remove_message_queue {
+            self.message_queues.remove(queue);
+        }
+    }
+
     #[tracing::instrument(skip(self))]
     async fn make_matches(&mut self, queue: &str) {
         loop {
+            self.pop_timed_out(queue);
             let request_queue = self.request_queues.get_mut(queue);
             let message_queue = self.message_queues.get_mut(queue);
             match (request_queue, message_queue) {
@@ -191,6 +275,38 @@ where
         }
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn process_timeout_at(&mut self, now: Instant) {
+        loop {
+            let timed_out = self
+                .message_timeouts
+                .peek()
+                .filter(|Reverse((timeout_at, _))| timeout_at < &now)
+                .is_some();
+            if timed_out {
+                let Reverse((_, id)) = self.message_timeouts.pop().unwrap();
+                event!(Level::INFO, message_id = id.to_string(), "message_timeout");
+                self.messages_by_sequence_number.remove(&id);
+            } else {
+                break;
+            }
+        }
+        loop {
+            let timed_out = self
+                .request_timeouts
+                .peek()
+                .filter(|Reverse((timeout_at, _))| timeout_at < &now)
+                .is_some();
+            if timed_out {
+                let Reverse((_, id)) = self.request_timeouts.pop().unwrap();
+                event!(Level::INFO, request_id = id.to_string(), "request_timeout");
+                self.requests_by_sequence_number.remove(&id);
+            } else {
+                break;
+            }
+        }
+    }
+
     async fn process_request(&mut self, request: Request<T>) {
         info!("Received request");
         match request {
@@ -201,12 +317,34 @@ where
 
     #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) {
+        let tick_sender = self.tick_sender.clone();
+        tokio::spawn(async move {
+            loop {
+                match tick_sender.send(Instant::now()) {
+                    Ok(_) => {}
+                    Err(_) => break,
+                };
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let mut tick_receiver = self.tick_receiver.take().expect("Can only run once");
         loop {
-            match self.request_receiver.recv().await {
-                Some(request) => self.process_request(request).await,
-                None => {
-                    info!("all connections dropped");
-                    return;
+            tokio::select! {
+                tick = tick_receiver.recv() => {
+                    match tick {
+                        Some(tick) => self.process_timeout_at(tick).await,
+                        None => return,
+                    }
+
+                }
+                message = self.request_receiver.recv() => {
+                    match message {
+                        Some(request) => self.process_request(request).await,
+                        None => {
+                            info!("all connections dropped");
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -225,7 +363,16 @@ impl<T> MessageExchangeConnection<T>
 where
     T: Message,
 {
-    pub async fn send_message(&self, message: T, queue: String, block: bool) -> SendStatus {
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
+    const MAX_TIMEOUT: Duration = Duration::from_secs(10);
+
+    pub async fn send_message(
+        &self,
+        message: T,
+        queue: String,
+        block: bool,
+        timeout: Option<Duration>,
+    ) -> SendStatus {
         let (response_sender, receiver) = if block {
             let (response_sender, receiver) = oneshot::channel();
             (Some(response_sender), Some(receiver))
@@ -245,6 +392,10 @@ where
             response_sender: DebugIgnore(response_sender),
             message: DebugIgnore(message),
             queue,
+            timeout: TimeoutStamp::new(min(
+                timeout.unwrap_or(Self::DEFAULT_TIMEOUT),
+                Self::MAX_TIMEOUT,
+            )),
         });
         let result = match self.request_sender.send(message) {
             Ok(()) => match receiver {
@@ -260,7 +411,11 @@ where
         result
     }
 
-    pub async fn receive_message(&self, queue: String) -> RecieveStatus<T> {
+    pub async fn receive_message(
+        &self,
+        queue: String,
+        timeout: Option<Duration>,
+    ) -> RecieveStatus<T> {
         let (response_sender, receiver) = oneshot::channel();
         let id = Uuid::new_v4();
         let span = span!(
@@ -274,6 +429,10 @@ where
             id,
             response_sender: DebugIgnore(response_sender),
             queue,
+            timeout: TimeoutStamp::new(min(
+                timeout.unwrap_or(Self::DEFAULT_TIMEOUT),
+                Self::MAX_TIMEOUT,
+            )),
         });
         let result = match self.request_sender.send(request) {
             Ok(()) => match receiver.await {
@@ -297,6 +456,7 @@ where
 mod tests {
     use std::{env, sync::Once};
 
+    use tokio::time;
     use tracing_subscriber::fmt::format::FmtSpan;
 
     use super::*;
@@ -315,7 +475,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_send_receive() {
         initialize_logger();
         let (connection, mut exchange) = MessageExchange::<String>::new();
@@ -325,16 +485,23 @@ mod tests {
         let send_connection = connection.clone();
         tokio::spawn(async move {
             send_connection
-                .send_message("hello, world".to_string(), "greetings".to_string(), true)
+                .send_message(
+                    "hello, world".to_string(),
+                    "greetings".to_string(),
+                    true,
+                    None,
+                )
                 .await;
         });
         assert_eq!(
-            connection.receive_message("greetings".to_string()).await,
+            connection
+                .receive_message("greetings".to_string(), None)
+                .await,
             RecieveStatus::Received("hello, world".to_string())
         )
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_send_receive_multiple() {
         initialize_logger();
         let (connection, mut exchange) = MessageExchange::<String>::new();
@@ -345,30 +512,39 @@ mod tests {
         tokio::spawn(async move {
             for i in 1..2 {
                 send_connection
-                    .send_message(format!("Hello, {}", i), "greetings".to_string(), true)
+                    .send_message(format!("Hello, {}", i), "greetings".to_string(), true, None)
                     .await;
             }
             for i in 1..2 {
                 send_connection
-                    .send_message(format!("Goodbye, {}", i), "farewells".to_string(), true)
+                    .send_message(
+                        format!("Goodbye, {}", i),
+                        "farewells".to_string(),
+                        true,
+                        None,
+                    )
                     .await;
             }
         });
         for i in 1..2 {
             assert_eq!(
-                connection.receive_message("greetings".to_string()).await,
+                connection
+                    .receive_message("greetings".to_string(), None)
+                    .await,
                 RecieveStatus::Received(format!("Hello, {}", i))
             )
         }
         for i in 1..2 {
             assert_eq!(
-                connection.receive_message("farewells".to_string()).await,
+                connection
+                    .receive_message("farewells".to_string(), None)
+                    .await,
                 RecieveStatus::Received(format!("Goodbye, {}", i))
             )
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_send_receive_multiple_nonblocking() {
         initialize_logger();
         let (connection, mut exchange) = MessageExchange::<String>::new();
@@ -379,26 +555,71 @@ mod tests {
         tokio::spawn(async move {
             for i in 1..2 {
                 send_connection
-                    .send_message(format!("Goodbye, {}", i), "farewells".to_string(), false)
+                    .send_message(
+                        format!("Goodbye, {}", i),
+                        "farewells".to_string(),
+                        false,
+                        None,
+                    )
                     .await;
             }
             for i in 1..2 {
                 send_connection
-                    .send_message(format!("Hello, {}", i), "greetings".to_string(), false)
+                    .send_message(
+                        format!("Hello, {}", i),
+                        "greetings".to_string(),
+                        false,
+                        None,
+                    )
                     .await;
             }
         });
         for i in 1..2 {
             assert_eq!(
-                connection.receive_message("greetings".to_string()).await,
+                connection
+                    .receive_message("greetings".to_string(), None)
+                    .await,
                 RecieveStatus::Received(format!("Hello, {}", i))
             )
         }
         for i in 1..2 {
             assert_eq!(
-                connection.receive_message("farewells".to_string()).await,
+                connection
+                    .receive_message("farewells".to_string(), None)
+                    .await,
                 RecieveStatus::Received(format!("Goodbye, {}", i))
             )
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_timeout() {
+        initialize_logger();
+        time::pause();
+        let (connection, mut exchange) = MessageExchange::<String>::new();
+        tokio::spawn(async move {
+            exchange.run().await;
+        });
+        connection
+            .send_message(
+                "forget".to_string(),
+                "queue".to_string(),
+                false,
+                Some(Duration::from_secs(1)),
+            )
+            .await;
+        connection
+            .send_message(
+                "remember".to_string(),
+                "queue".to_string(),
+                false,
+                Some(Duration::from_secs(3)),
+            )
+            .await;
+        time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            connection.receive_message("queue".to_string(), None).await,
+            RecieveStatus::Received("remember".to_string())
+        )
     }
 }
