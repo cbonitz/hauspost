@@ -82,6 +82,12 @@ where
             }
         }
     }
+
+    #[tracing::instrument(skip(self, message), fields(request_id = %self.id, message_id=%message.id))]
+    fn respond_with(mut self, mut message: SendMessage<T>) {
+        message.reply(SendStatus::Received);
+        self.reply(RecieveStatus::Received(message.message.0));
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -122,186 +128,100 @@ where
     }
 }
 
-#[derive(Debug)]
-enum Request<T>
-where
-    T: Message,
-{
-    Receive(RequestReceive<T>),
-    Send(SendMessage<T>),
+#[derive(Eq, PartialEq)]
+enum QueueStatus {
+    Empty,
+    Nonempty,
 }
-pub struct MessageExchange<T>
+
+pub struct Queue<T>
 where
     T: Message,
 {
-    request_queues: HashMap<String, LinkedList<Uuid>>,
+    name: String,
+    request_queue: LinkedList<Uuid>,
     request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
     requests_by_sequence_number: HashMap<Uuid, RequestReceive<T>>,
-    message_queues: HashMap<String, LinkedList<Uuid>>,
+    message_queue: LinkedList<Uuid>,
     message_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
     messages_by_sequence_number: HashMap<Uuid, SendMessage<T>>,
-    request_receiver: mpsc::UnboundedReceiver<Request<T>>,
-    tick_sender: mpsc::UnboundedSender<Instant>,
-    tick_receiver: Option<mpsc::UnboundedReceiver<Instant>>,
 }
 
-impl<T> MessageExchange<T>
+impl<T> Queue<T>
 where
     T: Message,
 {
-    pub fn new() -> (MessageExchangeConnection<T>, Self) {
-        let (request_sender, request_receiver) = mpsc::unbounded_channel();
-        let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
-        (
-            MessageExchangeConnection { request_sender },
-            Self {
-                request_queues: HashMap::new(),
-                request_timeouts: BinaryHeap::new(),
-                requests_by_sequence_number: HashMap::new(),
-                message_queues: HashMap::new(),
-                message_timeouts: BinaryHeap::new(),
-                messages_by_sequence_number: HashMap::new(),
-                request_receiver,
-                tick_sender,
-                tick_receiver: Some(tick_receiver),
-            },
-        )
-    }
-
-    #[tracing::instrument(skip(self, request), fields(request_id = %request.id, queue=%request.queue))]
-    async fn receive(&mut self, request: RequestReceive<T>) {
-        info!("Receive request {}", request.id);
-        let queue = request.queue.clone();
-        match self.request_queues.get_mut(queue.as_str()) {
-            Some(queue) => queue.push_back(request.id),
-            None => {
-                self.request_queues
-                    .insert(queue.clone(), LinkedList::from([request.id]));
-                ()
-            }
-        }
-        self.request_timeouts
-            .push(Reverse((request.timeout.timeout_at, request.id.clone())));
-        self.requests_by_sequence_number.insert(request.id, request);
-        self.make_matches(&queue).await;
-    }
-
-    #[tracing::instrument(skip(self, message),fields(message_id = %message.id, queue=%message.queue))]
-    async fn send(&mut self, message: SendMessage<T>) {
-        info!("Send request {}", message.id);
-        let queue = message.queue.clone();
-        match self.message_queues.get_mut(queue.as_str()) {
-            Some(queue) => queue.push_back(message.id),
-            None => {
-                self.message_queues
-                    .insert(queue.clone(), LinkedList::from([message.id]));
-                ()
-            }
-        }
-        self.message_timeouts
-            .push(Reverse((message.timeout.timeout_at, message.id.clone())));
-        self.messages_by_sequence_number.insert(message.id, message);
-        self.make_matches(queue.as_str()).await;
-    }
-
-    #[tracing::instrument(skip(request, message), fields(request_id = %request.id, message_id=%message.id))]
-    async fn process_match(mut request: RequestReceive<T>, mut message: SendMessage<T>) {
-        message.reply(SendStatus::Received);
-        request.reply(RecieveStatus::Received(message.message.0));
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn pop_timed_out(&mut self, queue: &str) {
-        let request_queue = self.request_queues.get_mut(queue);
-        let mut remove_request_queue = false;
-        if let Some(request_queue) = request_queue {
-            loop {
-                let front = request_queue.front();
-                match front {
-                    Some(elem) => {
-                        if !self.requests_by_sequence_number.contains_key(elem) {
-                            request_queue.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    None => {}
-                }
-                if request_queue.is_empty() {
-                    remove_request_queue = true;
-                    break;
-                }
-            }
-        }
-        if remove_request_queue {
-            self.request_queues.remove(queue);
-        }
-        let message_queue = self.message_queues.get_mut(queue);
-        let mut remove_message_queue = false;
-        if let Some(message_queue) = message_queue {
-            loop {
-                let front = message_queue.front();
-                match front {
-                    Some(elem) => {
-                        if !self.messages_by_sequence_number.contains_key(elem) {
-                            message_queue.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    None => {}
-                }
-                if message_queue.is_empty() {
-                    remove_message_queue = true;
-                    break;
-                }
-            }
-        }
-        if remove_message_queue {
-            self.message_queues.remove(queue);
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            request_queue: LinkedList::new(),
+            request_timeouts: BinaryHeap::new(),
+            requests_by_sequence_number: HashMap::new(),
+            message_queue: LinkedList::new(),
+            message_timeouts: BinaryHeap::new(),
+            messages_by_sequence_number: HashMap::new(),
         }
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn make_matches(&mut self, queue: &str) {
+    fn pop_timed_out_in<U>(
+        queue: &mut LinkedList<Uuid>,
+        entities_by_sequence_number: &HashMap<Uuid, U>,
+    ) {
         loop {
-            self.pop_timed_out(queue);
-            let request_queue = self.request_queues.get_mut(queue);
-            let message_queue = self.message_queues.get_mut(queue);
-            match (request_queue, message_queue) {
-                (Some(request_queue), Some(message_queue)) => {
-                    let request_id = request_queue
-                        .pop_front()
-                        .expect("No empty request queue should ever be in requests map");
-                    if request_queue.is_empty() {
-                        self.request_queues.remove(queue);
+            let front = queue.front();
+            match front {
+                Some(elem) => {
+                    if !entities_by_sequence_number.contains_key(elem) {
+                        queue.pop_front();
+                    } else {
+                        break;
                     }
-                    let request = self
-                        .requests_by_sequence_number
-                        .remove(&request_id)
-                        .expect("Queues and request lists must match");
-                    let message_id = message_queue
-                        .pop_front()
-                        .expect("No empty request queue should ever be in requests map");
-                    if message_queue.is_empty() {
-                        self.message_queues.remove(queue);
-                    }
-                    let message = self
-                        .messages_by_sequence_number
-                        .remove(&message_id)
-                        .expect("Queues and message lists must match");
-                    Self::process_match(request, message).await;
                 }
-
-                _ => {
-                    break;
-                }
+                None => break,
             }
         }
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn process_timeout_at(&mut self, now: Instant) {
+    fn pop_timed_out(&mut self) -> QueueStatus {
+        Self::pop_timed_out_in(&mut self.message_queue, &self.messages_by_sequence_number);
+        Self::pop_timed_out_in(&mut self.request_queue, &self.requests_by_sequence_number);
+        if self.request_queue.is_empty() && self.message_queue.is_empty() {
+            QueueStatus::Empty
+        } else {
+            QueueStatus::Nonempty
+        }
+    }
+
+    #[tracing::instrument(skip(self), fields(queue=self.name))]
+    fn make_matches(&mut self) -> QueueStatus {
+        if self.request_queue.is_empty() && self.message_queue.is_empty() {
+            return QueueStatus::Empty;
+        }
+        if self.request_queue.is_empty() || self.message_queue.is_empty() {
+            return QueueStatus::Nonempty;
+        }
+        let request_id = self
+            .request_queue
+            .pop_front()
+            .expect("No empty request queue should ever be in requests map");
+        let request = self
+            .requests_by_sequence_number
+            .remove(&request_id)
+            .expect("Queues and request lists must match");
+        let message_id = self
+            .message_queue
+            .pop_front()
+            .expect("No empty request queue should ever be in requests map");
+        let message = self
+            .messages_by_sequence_number
+            .remove(&message_id)
+            .expect("Queues and message lists must match");
+        request.respond_with(message);
+        self.pop_timed_out()
+    }
+
+    #[tracing::instrument(skip(self), fields(queue=self.name))]
+    fn process_timeout_at(&mut self, now: Instant) -> QueueStatus {
         loop {
             let timed_out = self
                 .message_timeouts
@@ -333,6 +253,111 @@ where
             } else {
                 break;
             }
+        }
+        self.pop_timed_out()
+    }
+
+    #[tracing::instrument(skip(self, request), fields(queue=self.name, request_id = %request.id, queue=%request.queue))]
+    fn receive(&mut self, request: RequestReceive<T>) -> QueueStatus {
+        self.request_queue.push_back(request.id);
+        self.request_timeouts
+            .push(Reverse((request.timeout.timeout_at, request.id.clone())));
+        self.requests_by_sequence_number.insert(request.id, request);
+        self.make_matches()
+    }
+
+    #[tracing::instrument(skip(self, message), fields(message_id = %message.id, queue=%message.queue))]
+    fn send(&mut self, message: SendMessage<T>) -> QueueStatus {
+        self.message_queue.push_back(message.id);
+        self.message_timeouts
+            .push(Reverse((message.timeout.timeout_at, message.id.clone())));
+        self.messages_by_sequence_number.insert(message.id, message);
+        self.make_matches()
+    }
+}
+#[derive(Debug)]
+enum Request<T>
+where
+    T: Message,
+{
+    Receive(RequestReceive<T>),
+    Send(SendMessage<T>),
+}
+pub struct MessageExchange<T>
+where
+    T: Message,
+{
+    queues: HashMap<String, Queue<T>>,
+    request_receiver: mpsc::UnboundedReceiver<Request<T>>,
+    tick_sender: mpsc::UnboundedSender<Instant>,
+    tick_receiver: Option<mpsc::UnboundedReceiver<Instant>>,
+}
+
+impl<T> MessageExchange<T>
+where
+    T: Message,
+{
+    pub fn new() -> (MessageExchangeConnection<T>, Self) {
+        let (request_sender, request_receiver) = mpsc::unbounded_channel();
+        let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
+        (
+            MessageExchangeConnection { request_sender },
+            Self {
+                queues: HashMap::new(),
+                request_receiver,
+                tick_sender,
+                tick_receiver: Some(tick_receiver),
+            },
+        )
+    }
+
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.id, queue=%request.queue))]
+    async fn receive(&mut self, request: RequestReceive<T>) {
+        let queue_name = request.queue.clone();
+        match self.queues.get_mut(&request.queue) {
+            Some(queue) => {
+                if queue.receive(request) == QueueStatus::Empty {
+                    info!(queue_name = queue_name, "remove empty queue");
+                    self.queues.remove(&queue_name);
+                }
+            }
+            None => {
+                let mut queue = Queue::new(&request.queue);
+                queue.receive(request);
+                self.queues.insert(queue_name, queue);
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self, message),fields(message_id = %message.id, queue=%message.queue))]
+    async fn send(&mut self, message: SendMessage<T>) {
+        let queue_name = message.queue.clone();
+        match self.queues.get_mut(&message.queue) {
+            Some(queue) => {
+                if queue.send(message) == QueueStatus::Empty {
+                    info!(queue_name = queue_name, "remove empty queue");
+                    self.queues.remove(&queue_name);
+                }
+            }
+            None => {
+                let mut queue = Queue::new(&message.queue);
+                queue.send(message);
+                self.queues.insert(queue_name, queue);
+            }
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn process_timeout_at(&mut self, now: Instant) {
+        let mut remove = vec![];
+        for (queue_name, queue) in self.queues.iter_mut() {
+            if queue.process_timeout_at(now) == QueueStatus::Empty {
+                remove.push(queue_name.clone());
+            }
+        }
+        for queue_name in remove {
+            info!(queue_name = queue_name, "remove empty queue");
+            self.queues.remove(&queue_name);
         }
     }
 
@@ -511,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_receive() {
+    async fn test_send_receive_single() {
         initialize_logger();
         let (connection, mut exchange) = MessageExchange::<String>::new();
         tokio::spawn(async move {
