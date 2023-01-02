@@ -15,7 +15,7 @@ pub trait RespondWithTimeout {
     fn respond_with_timeout(self);
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum QueueStatus {
     Empty,
     Nonempty,
@@ -161,5 +161,170 @@ where
             .push(Reverse((timeout_at, id.clone())));
         self.messages_by_sequence_number.insert(id, message);
         self.make_matches()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Queue, QueueStatus};
+    use crate::{
+        exchange::{Message, RecieveStatus, SendStatus},
+        requests::{RequestReceive, RequestSend, TimeoutStamp},
+    };
+    use itertools::Itertools;
+    use std::{env, iter::repeat, sync::Once, time::Duration};
+    use tokio::{sync::oneshot, time};
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    static INITIALIZE_LOGGER: Once = Once::new();
+
+    fn initialize_logger() {
+        if let Ok(val) = env::var("TRACE_TESTS") {
+            if val == "1" {
+                INITIALIZE_LOGGER.call_once(|| {
+                    tracing_subscriber::fmt()
+                        .with_span_events(FmtSpan::ACTIVE)
+                        .init();
+                });
+            }
+        }
+    }
+
+    fn q() -> Queue<RequestReceive<u64>, RequestSend<u64>> {
+        Queue::new("foo")
+    }
+
+    const TIMEOUT: Duration = Duration::from_millis(1);
+
+    fn receive() -> (oneshot::Receiver<RecieveStatus<u64>>, RequestReceive<u64>) {
+        RequestReceive::new("foo".to_string(), TimeoutStamp::new(TIMEOUT.clone()))
+    }
+    fn send(message: u64) -> (oneshot::Receiver<SendStatus>, RequestSend<u64>) {
+        let (receiver, request) = RequestSend::new(
+            "foo".to_string(),
+            TimeoutStamp::new(TIMEOUT.clone()),
+            message,
+            true,
+        );
+        (receiver.unwrap(), request)
+    }
+
+    impl<T> Queue<RequestReceive<T>, RequestSend<T>>
+    where
+        T: Message,
+    {
+        pub fn send_receive_request(&mut self, request: RequestReceive<T>) -> QueueStatus {
+            let timeout_at = request.timeout.timeout_at.clone();
+            let send_id = request.id.clone();
+            self.receive(request, send_id, timeout_at)
+        }
+
+        pub fn send_send_request(&mut self, request: RequestSend<T>) -> QueueStatus {
+            let timeout_at = request.timeout.timeout_at.clone();
+            let send_id = request.id.clone();
+            self.send(request, send_id, timeout_at)
+        }
+    }
+
+    async fn assert_send_received(receiver: oneshot::Receiver<SendStatus>) {
+        assert_eq!(receiver.await.unwrap(), SendStatus::Received);
+    }
+    async fn assert_receive_received<T>(receiver: oneshot::Receiver<RecieveStatus<T>>, message: T)
+    where
+        T: Message + PartialEq,
+    {
+        assert_eq!(receiver.await.unwrap(), RecieveStatus::Received(message));
+    }
+
+    #[tokio::test]
+    async fn test_send_then_receive() {
+        initialize_logger();
+        time::pause();
+        let mut q = q();
+        let (send_status_receiver, send_request) = send(1);
+        let (receive_status_receiver, receive_request) = receive();
+
+        assert_eq!(q.send_send_request(send_request), QueueStatus::Nonempty);
+        assert_eq!(q.send_receive_request(receive_request), QueueStatus::Empty);
+
+        assert_send_received(send_status_receiver).await;
+        assert_receive_received(receive_status_receiver, 1).await;
+    }
+
+    #[tokio::test]
+    async fn test_receive_then_send() {
+        initialize_logger();
+
+        time::pause();
+        let mut q = q();
+        let (send_status_receiver, send_request) = send(1);
+        let (receive_status_receiver, receive_request) = receive();
+
+        assert_eq!(
+            q.send_receive_request(receive_request),
+            QueueStatus::Nonempty
+        );
+        assert_eq!(q.send_send_request(send_request), QueueStatus::Empty);
+
+        assert_send_received(send_status_receiver).await;
+        assert_receive_received(receive_status_receiver, 1).await;
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum SendReceive {
+        Send,
+        Receive,
+    }
+
+    /// Interleaves send/receive requests in order and validates correct send/receive status
+    async fn send_then_receive_interleaved(number_of_pairs: usize, steps: Vec<SendReceive>) {
+        let mut q = q();
+        let mut send_receivers = vec![];
+        let mut send_requests = vec![];
+        let mut receive_receivers = vec![];
+        let mut receive_requests = vec![];
+        for i in 0..number_of_pairs {
+            let (send_receiver, send_request) = send(i as u64);
+            send_receivers.push(send_receiver);
+            send_requests.push(send_request);
+            let (receive_receiver, receive_request) = receive();
+            receive_receivers.push(receive_receiver);
+            receive_requests.push(receive_request);
+        }
+        let mut last_queue_status = QueueStatus::Nonempty;
+        for step in steps {
+            last_queue_status = match step {
+                SendReceive::Send => q.send_send_request(send_requests.remove(0)),
+                SendReceive::Receive => q.send_receive_request(receive_requests.remove(0)),
+            };
+        }
+        assert_eq!(last_queue_status, QueueStatus::Empty);
+        for send_receiver in send_receivers.into_iter() {
+            assert_send_received(send_receiver).await;
+        }
+        for (i, receive_receiver) in receive_receivers.into_iter().enumerate() {
+            assert_receive_received(receive_receiver, i as u64).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_then_receive_interleaved() {
+        initialize_logger();
+        time::pause();
+        let number_of_pairs = 3;
+        let mut steps = vec![];
+        steps.append(
+            &mut repeat(SendReceive::Receive)
+                .take(number_of_pairs)
+                .collect_vec(),
+        );
+        steps.append(
+            &mut repeat(SendReceive::Send)
+                .take(number_of_pairs)
+                .collect_vec(),
+        );
+        for permutation in steps.into_iter().permutations(number_of_pairs * 2) {
+            send_then_receive_interleaved(number_of_pairs, permutation).await;
+        }
     }
 }
