@@ -171,7 +171,9 @@ mod tests {
         exchange::{Message, RecieveStatus, SendStatus},
         requests::{RequestReceive, RequestSend, TimeoutStamp},
     };
+    use distinct_permutations::distinct_permutations;
     use itertools::Itertools;
+    use std::cmp::Ord;
     use std::{env, iter::repeat, sync::Once, time::Duration};
     use tokio::{sync::oneshot, time};
     use tracing_subscriber::fmt::format::FmtSpan;
@@ -270,7 +272,7 @@ mod tests {
         assert_receive_received(receive_status_receiver, 1).await;
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
     pub enum SendReceive {
         Send,
         Receive,
@@ -311,7 +313,7 @@ mod tests {
     async fn test_send_then_receive_interleaved() {
         initialize_logger();
         time::pause();
-        let number_of_pairs = 3;
+        let number_of_pairs = 5;
         let mut steps = vec![];
         steps.append(
             &mut repeat(SendReceive::Receive)
@@ -323,7 +325,7 @@ mod tests {
                 .take(number_of_pairs)
                 .collect_vec(),
         );
-        for permutation in steps.into_iter().permutations(number_of_pairs * 2) {
+        for permutation in distinct_permutations(steps) {
             send_then_receive_interleaved(number_of_pairs, permutation).await;
         }
     }

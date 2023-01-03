@@ -384,7 +384,7 @@ mod tests {
                         format!("message {}", i),
                         format!("messages {}", i % 10),
                         false,
-                        None,
+                        Some(Duration::from_secs(15)),
                     )
                     .await;
             }
@@ -392,7 +392,10 @@ mod tests {
         for i in 1..count {
             assert_eq!(
                 connection
-                    .receive_message(format!("messages {}", i % 10), None)
+                    .receive_message(
+                        format!("messages {}", i % 10),
+                        Some(Duration::from_secs(15)),
+                    )
                     .await,
                 RecieveStatus::Received(format!("message {}", i))
             )
