@@ -1,3 +1,4 @@
+//! Requests and responses used in the message exchange.
 use std::time::Duration;
 
 use debug_ignore::DebugIgnore;
@@ -13,6 +14,7 @@ use crate::{
     queue::{RespondWith, RespondWithTimeout},
 };
 
+/// Request to receive a message.
 #[derive(Debug)]
 pub struct RequestReceive<T>
 where
@@ -60,7 +62,7 @@ where
 {
     #[tracing::instrument(skip(self, message), fields(request_id = %self.id, message_id=%message.id))]
     fn respond_with(mut self, mut message: RequestSend<T>) {
-        message.reply(SendStatus::Received);
+        message.reply(SendStatus::Delivered);
         self.reply(RecieveStatus::Received(message.message.0));
     }
 }
@@ -74,6 +76,7 @@ where
     }
 }
 
+/// Request to send a message.
 #[derive(Debug)]
 pub struct RequestSend<T>
 where
@@ -128,6 +131,16 @@ where
     }
 }
 
+impl<T> RespondWithTimeout for RequestSend<T>
+where
+    T: Message,
+{
+    fn respond_with_timeout(mut self) {
+        self.reply(SendStatus::Timeout);
+    }
+}
+
+/// Encapsulates information to process and trace timeouts.
 #[derive(Debug)]
 pub struct TimeoutStamp {
     pub timeout_at: Instant,
@@ -141,14 +154,5 @@ impl TimeoutStamp {
             timeout_at: created_at + timeout_duration,
             created_at,
         }
-    }
-}
-
-impl<T> RespondWithTimeout for RequestSend<T>
-where
-    T: Message,
-{
-    fn respond_with_timeout(mut self) {
-        self.reply(SendStatus::Timeout);
     }
 }

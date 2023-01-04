@@ -1,3 +1,4 @@
+//! The message exchange and its connection.
 use std::{cmp::min, collections::HashMap, fmt, time::Duration};
 
 use tokio::{
@@ -11,16 +12,21 @@ use crate::{
     requests::{RequestReceive, RequestSend, TimeoutStamp},
 };
 
+/// Requirements for messages
 pub trait Message: Send + 'static {}
 impl<T> Message for T where T: Send + 'static {}
 
+/// Result of a receive operation
 #[derive(PartialEq, Eq)]
 pub enum RecieveStatus<T>
 where
     T: Message,
 {
-    InternalError,
+    /// A result was received.
     Received(T),
+    /// An internal error has occured.
+    InternalError,
+    /// The message request has timed out.
     Timeout,
 }
 
@@ -37,11 +43,16 @@ where
     }
 }
 
+/// Result of a send operation
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendStatus {
+    /// An internal error has occured.
     InternalError,
-    Received,
+    /// The message was delivered.
+    Delivered,
+    /// The message was enqueued for delivery.
     Enqueued,
+    /// The request has timed out.
     Timeout,
 }
 
@@ -53,6 +64,8 @@ where
     Receive(RequestReceive<T>),
     Send(RequestSend<T>),
 }
+
+/// A simple queue-based message exchange.
 pub struct MessageExchange<T>
 where
     T: Message,
@@ -70,6 +83,7 @@ where
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
     const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Create a message exchange together with a [MessageExchangeConnection].
     pub fn new() -> (MessageExchangeConnection<T>, Self) {
         let (request_sender, request_receiver) = mpsc::unbounded_channel();
         let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
@@ -156,6 +170,7 @@ where
         };
     }
 
+    /// This method needs to be running exactly once for the exchange to process requests.
     #[tracing::instrument(skip(self))]
     pub async fn run(&mut self) {
         let tick_sender = self.tick_sender.clone();
@@ -192,6 +207,7 @@ where
     }
 }
 
+/// A cloneable connection that clients can use to interact with a [MessageExchange]
 #[derive(Clone)]
 pub struct MessageExchangeConnection<T>
 where
@@ -206,10 +222,16 @@ impl<T> MessageExchangeConnection<T>
 where
     T: Message,
 {
+    /// Send `message` to `topic`.
+    ///
+    /// * If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
+    /// * `block` sets the blocking behavior:
+    ///   * If it is set to `true`, the method will return when the message was delivered , has timed out or an error occured.
+    ///   * If it is set to `false`, the method will return when the message was enqueued, or an error has occured doing so.
     pub async fn send_message(
         &self,
         message: T,
-        queue: String,
+        topic: String,
         block: bool,
         timeout: Option<Duration>,
     ) -> SendStatus {
@@ -217,7 +239,7 @@ where
             timeout.unwrap_or(self.default_timeout),
             self.max_timeout,
         ));
-        let (receiver, request) = RequestSend::new(queue, timeout, message, block);
+        let (receiver, request) = RequestSend::new(topic, timeout, message, block);
         let span = span!(
             Level::INFO,
             "send_message",
@@ -240,16 +262,17 @@ where
         result
     }
 
+    /// Register to receive a single message from `topic`. If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
     pub async fn receive_message(
         &self,
-        queue: String,
+        topic: String,
         timeout: Option<Duration>,
     ) -> RecieveStatus<T> {
         let timeout = TimeoutStamp::new(min(
             timeout.unwrap_or(self.default_timeout),
             self.max_timeout,
         ));
-        let (receiver, request) = RequestReceive::new(queue, timeout);
+        let (receiver, request) = RequestReceive::new(topic, timeout);
         let span = span!(
             Level::INFO,
             "receive_message",
@@ -462,7 +485,7 @@ mod tests {
             connection
                 .send_message(
                     "forget".to_string(),
-                    "queue".to_string(),
+                    "topic".to_string(),
                     true,
                     Some(Duration::from_millis(1)),
                 )
@@ -481,7 +504,7 @@ mod tests {
 
         let receive_result = tokio::spawn(async move {
             connection
-                .receive_message("queue".to_string(), Some(Duration::from_millis(1)))
+                .receive_message("topic".to_string(), Some(Duration::from_millis(1)))
                 .await
         });
         assert_eq!(receive_result.await.unwrap(), RecieveStatus::Timeout);
@@ -499,7 +522,7 @@ mod tests {
             send_connection
                 .send_message(
                     "forget".to_string(),
-                    "queue".to_string(),
+                    "topic".to_string(),
                     true,
                     Some(Duration::from_millis(1)),
                 )
@@ -509,7 +532,7 @@ mod tests {
 
         let receive_result = tokio::spawn(async move {
             connection
-                .receive_message("queue".to_string(), Some(Duration::from_millis(10)))
+                .receive_message("topic".to_string(), Some(Duration::from_millis(10)))
                 .await
         });
         assert_eq!(receive_result.await.unwrap(), RecieveStatus::Timeout);
@@ -526,7 +549,7 @@ mod tests {
         connection
             .send_message(
                 "forget".to_string(),
-                "queue".to_string(),
+                "topic".to_string(),
                 false,
                 Some(Duration::from_secs(1)),
             )
@@ -534,14 +557,14 @@ mod tests {
         connection
             .send_message(
                 "remember".to_string(),
-                "queue".to_string(),
+                "topic".to_string(),
                 false,
                 Some(Duration::from_secs(3)),
             )
             .await;
         time::advance(Duration::from_secs(2)).await;
         assert_eq!(
-            connection.receive_message("queue".to_string(), None).await,
+            connection.receive_message("topic".to_string(), None).await,
             RecieveStatus::Received("remember".to_string())
         )
     }
@@ -558,7 +581,7 @@ mod tests {
             connection
                 .send_message(
                     "forget".to_string(),
-                    "queue".to_string(),
+                    "topic".to_string(),
                     false,
                     Some(Duration::from_secs(1)),
                 )
@@ -568,7 +591,7 @@ mod tests {
             connection
                 .send_message(
                     "remember".to_string(),
-                    "queue".to_string(),
+                    "topic".to_string(),
                     false,
                     Some(Duration::from_secs(3)),
                 )
@@ -577,7 +600,7 @@ mod tests {
         time::advance(Duration::from_secs(2)).await;
         for _ in 1..5_000 {
             assert_eq!(
-                connection.receive_message("queue".to_string(), None).await,
+                connection.receive_message("topic".to_string(), None).await,
                 RecieveStatus::Received("remember".to_string())
             )
         }

@@ -1,65 +1,85 @@
+//! Implmementation of a queue and its associated traits.
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, LinkedList},
+    collections::{BinaryHeap, HashMap, VecDeque},
 };
 
 use tokio::time::Instant;
 use tracing::{event, Level};
 use uuid::Uuid;
 
+/// The ability to respond with a response of type `T`
 pub trait RespondWith<T> {
     fn respond_with(self, response: T);
 }
 
+/// The ability to respond with a timeout
 pub trait RespondWithTimeout {
     fn respond_with_timeout(self);
 }
 
+/// Status of a queue
 #[derive(Eq, PartialEq, Debug)]
 pub enum QueueStatus {
+    /// The queue is empty
     Empty,
+    /// The queue is nonempty
     Nonempty,
 }
 
-pub struct Queue<Req, Res>
+/// A queue abstraction that will match requests of type `Req` to responses of type `Msg` in a FIFO matter.
+///
+/// At the core, there are
+/// * a pair of HashMaps to store the requests indexed by their IDs.
+/// * a pair of queues for send and receive requests.
+/// * a pair of heaps for their timeouts.
+/// After each send/receive request, an attempt will be made to match the new send/recieive request with a corresponding receive/send request.
+/// Timeouts will remove the request from its HashMap, and pop all expired ids from the front of the send/receive queues.
+///
+/// The following invariant is maintained after each possible operation:
+/// 1. Both the send and receive request queues are either empty, or their head is a non-expired request, i.e. the request is still in the corresponding HashMap.
+/// 2. At most one of the two queues is nonempty.
+pub struct Queue<Req, Msg>
 where
-    Req: RespondWith<Res>,
+    Req: RespondWith<Msg>,
 {
     name: String,
-    request_queue: LinkedList<Uuid>,
-    request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
-    requests_by_sequence_number: HashMap<Uuid, Req>,
-    message_queue: LinkedList<Uuid>,
-    message_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
-    messages_by_sequence_number: HashMap<Uuid, Res>,
+    receive_request_queue: VecDeque<Uuid>,
+    receive_request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
+    receive_requests: HashMap<Uuid, Req>,
+    message_request_queue: VecDeque<Uuid>,
+    message_request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
+    message_requests: HashMap<Uuid, Msg>,
 }
 
-impl<'a, 'b, Req, Res> Queue<Req, Res>
+impl<'a, 'b, Req, Msg> Queue<Req, Msg>
 where
-    Res: RespondWithTimeout,
-    Req: RespondWith<Res> + RespondWithTimeout,
+    Msg: RespondWithTimeout,
+    Req: RespondWith<Msg> + RespondWithTimeout,
 {
+    /// Creates a queue
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            request_queue: LinkedList::new(),
-            request_timeouts: BinaryHeap::new(),
-            requests_by_sequence_number: HashMap::new(),
-            message_queue: LinkedList::new(),
-            message_timeouts: BinaryHeap::new(),
-            messages_by_sequence_number: HashMap::new(),
+            receive_request_queue: VecDeque::new(),
+            receive_request_timeouts: BinaryHeap::new(),
+            receive_requests: HashMap::new(),
+            message_request_queue: VecDeque::new(),
+            message_request_timeouts: BinaryHeap::new(),
+            message_requests: HashMap::new(),
         }
     }
 
-    fn pop_timed_out_in<U>(
-        queue: &mut LinkedList<Uuid>,
-        entities_by_sequence_number: &HashMap<Uuid, U>,
+    /// Removes all IDs at the head of of `queue` that have no curresponding requests in `requests_by_id`
+    fn remove_ids_without_request_in<U>(
+        queue: &mut VecDeque<Uuid>,
+        requests_by_id: &HashMap<Uuid, U>,
     ) {
         loop {
             let front = queue.front();
             match front {
                 Some(elem) => {
-                    if !entities_by_sequence_number.contains_key(elem) {
+                    if !requests_by_id.contains_key(elem) {
                         queue.pop_front();
                     } else {
                         break;
@@ -70,56 +90,67 @@ where
         }
     }
 
-    fn pop_timed_out(&mut self) -> QueueStatus {
-        Self::pop_timed_out_in(&mut self.message_queue, &self.messages_by_sequence_number);
-        Self::pop_timed_out_in(&mut self.request_queue, &self.requests_by_sequence_number);
-        if self.request_queue.is_empty() && self.message_queue.is_empty() {
+    /// This method ensures invariant 1 of the struct documentation.
+    fn remove_requests_without_id(&mut self) -> QueueStatus {
+        Self::remove_ids_without_request_in(
+            &mut self.message_request_queue,
+            &self.message_requests,
+        );
+        Self::remove_ids_without_request_in(
+            &mut self.receive_request_queue,
+            &self.receive_requests,
+        );
+        if self.receive_request_queue.is_empty() && self.message_request_queue.is_empty() {
             QueueStatus::Empty
         } else {
             QueueStatus::Nonempty
         }
     }
 
+    /// Try to match a request to a response after a send or receive request was enqueued.
+    /// This method directly ensures invariant 2, and invariant 1 by calling another method,
+    /// so it needs to be called after every send or receive operation.
     #[tracing::instrument(skip(self), fields(queue=self.name))]
-    fn make_matches(&mut self) -> QueueStatus {
-        if self.request_queue.is_empty() && self.message_queue.is_empty() {
+    fn make_match(&mut self) -> QueueStatus {
+        if self.receive_request_queue.is_empty() && self.message_request_queue.is_empty() {
             return QueueStatus::Empty;
         }
-        if self.request_queue.is_empty() || self.message_queue.is_empty() {
+        if self.receive_request_queue.is_empty() || self.message_request_queue.is_empty() {
             return QueueStatus::Nonempty;
         }
-        let request_id = self
-            .request_queue
+        let rcv_req_id = self
+            .receive_request_queue
             .pop_front()
             .expect("No empty request queue should ever be in requests map");
         let request = self
-            .requests_by_sequence_number
-            .remove(&request_id)
+            .receive_requests
+            .remove(&rcv_req_id)
             .expect("Queues and request lists must match");
-        let message_id = self
-            .message_queue
+        let msg_req_id = self
+            .message_request_queue
             .pop_front()
             .expect("No empty request queue should ever be in requests map");
         let message = self
-            .messages_by_sequence_number
-            .remove(&message_id)
+            .message_requests
+            .remove(&msg_req_id)
             .expect("Queues and message lists must match");
         request.respond_with(message);
-        self.pop_timed_out()
+        self.remove_requests_without_id()
     }
 
+    /// Process potential timeouts at instant `now`.
     #[tracing::instrument(skip(self), fields(queue=self.name))]
     pub fn process_timeout_at(&mut self, now: Instant) -> QueueStatus {
         loop {
             let timed_out = self
-                .message_timeouts
+                .message_request_timeouts
                 .peek()
                 .filter(|Reverse((timeout_at, _))| timeout_at < &now)
                 .is_some();
             if timed_out {
-                let Reverse((_, id)) = self.message_timeouts.pop().unwrap();
-                event!(Level::INFO, message_id = id.to_string(), "message_timeout");
-                if let Some(message) = self.messages_by_sequence_number.remove(&id) {
+                let Reverse((_, id)) = self.message_request_timeouts.pop().unwrap();
+                event!(Level::INFO, msg_req_id = id.to_string(), "message_timeout");
+                if let Some(message) = self.message_requests.remove(&id) {
                     message.respond_with_timeout();
                 }
             } else {
@@ -128,39 +159,41 @@ where
         }
         loop {
             let timed_out = self
-                .request_timeouts
+                .receive_request_timeouts
                 .peek()
                 .filter(|Reverse((timeout_at, _))| timeout_at < &now)
                 .is_some();
             if timed_out {
-                let Reverse((_, id)) = self.request_timeouts.pop().unwrap();
-                event!(Level::INFO, request_id = id.to_string(), "request_timeout");
-                if let Some(sender) = self.requests_by_sequence_number.remove(&id) {
+                let Reverse((_, id)) = self.receive_request_timeouts.pop().unwrap();
+                event!(Level::INFO, rcv_req_id = id.to_string(), "request_timeout");
+                if let Some(sender) = self.receive_requests.remove(&id) {
                     sender.respond_with_timeout();
                 }
             } else {
                 break;
             }
         }
-        self.pop_timed_out()
+        self.remove_requests_without_id()
     }
 
-    #[tracing::instrument(skip(self, request), fields(queue=self.name, request_id=%id))]
-    pub fn receive(&mut self, request: Req, id: Uuid, timeout_at: Instant) -> QueueStatus {
-        self.request_queue.push_back(id.clone());
-        self.request_timeouts
+    /// Process a receive request.
+    #[tracing::instrument(skip(self, receive_request), fields(queue=self.name, rcv_req_id=%id))]
+    pub fn receive(&mut self, receive_request: Req, id: Uuid, timeout_at: Instant) -> QueueStatus {
+        self.receive_request_queue.push_back(id.clone());
+        self.receive_request_timeouts
             .push(Reverse((timeout_at, id.clone())));
-        self.requests_by_sequence_number.insert(id, request);
-        self.make_matches()
+        self.receive_requests.insert(id, receive_request);
+        self.make_match()
     }
 
-    #[tracing::instrument(skip(self, message), fields(queue=self.name, message_id=%id))]
-    pub fn send(&mut self, message: Res, id: Uuid, timeout_at: Instant) -> QueueStatus {
-        self.message_queue.push_back(id.clone());
-        self.message_timeouts
+    /// Process a message request.
+    #[tracing::instrument(skip(self, message_request), fields(queue=self.name, msg_req_id=%id))]
+    pub fn send(&mut self, message_request: Msg, id: Uuid, timeout_at: Instant) -> QueueStatus {
+        self.message_request_queue.push_back(id.clone());
+        self.message_request_timeouts
             .push(Reverse((timeout_at, id.clone())));
-        self.messages_by_sequence_number.insert(id, message);
-        self.make_matches()
+        self.message_requests.insert(id, message_request);
+        self.make_match()
     }
 }
 
@@ -229,7 +262,7 @@ mod tests {
     }
 
     async fn assert_send_received(receiver: oneshot::Receiver<SendStatus>) {
-        assert_eq!(receiver.await.unwrap(), SendStatus::Received);
+        assert_eq!(receiver.await.unwrap(), SendStatus::Delivered);
     }
     async fn assert_receive_received<T>(receiver: oneshot::Receiver<RecieveStatus<T>>, message: T)
     where
