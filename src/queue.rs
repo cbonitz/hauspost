@@ -201,7 +201,7 @@ where
 mod tests {
     use super::{Queue, QueueStatus};
     use crate::{
-        exchange::{Message, RecieveStatus, SendStatus},
+        exchange::{Message, ReceiveStatus, SendStatus},
         requests::{RequestReceive, RequestSend, TimeoutStamp},
     };
     use distinct_permutations::distinct_permutations;
@@ -231,7 +231,7 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_millis(1);
 
-    fn receive() -> (oneshot::Receiver<RecieveStatus<u64>>, RequestReceive<u64>) {
+    fn receive() -> (oneshot::Receiver<ReceiveStatus<u64>>, RequestReceive<u64>) {
         RequestReceive::new("foo".to_string(), TimeoutStamp::new(TIMEOUT.clone()))
     }
     fn send(message: u64) -> (oneshot::Receiver<SendStatus>, RequestSend<u64>) {
@@ -264,11 +264,11 @@ mod tests {
     async fn assert_send_received(receiver: oneshot::Receiver<SendStatus>) {
         assert_eq!(receiver.await.unwrap(), SendStatus::Delivered);
     }
-    async fn assert_receive_received<T>(receiver: oneshot::Receiver<RecieveStatus<T>>, message: T)
+    async fn assert_receive_received<T>(receiver: oneshot::Receiver<ReceiveStatus<T>>, message: T)
     where
         T: Message + PartialEq,
     {
-        assert_eq!(receiver.await.unwrap(), RecieveStatus::Received(message));
+        assert_eq!(receiver.await.unwrap(), ReceiveStatus::Received(message));
     }
 
     #[tokio::test]

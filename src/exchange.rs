@@ -18,7 +18,7 @@ impl<T> Message for T where T: Send + 'static {}
 
 /// Result of a receive operation
 #[derive(PartialEq, Eq)]
-pub enum RecieveStatus<T>
+pub enum ReceiveStatus<T>
 where
     T: Message,
 {
@@ -30,7 +30,7 @@ where
     Timeout,
 }
 
-impl<T> fmt::Debug for RecieveStatus<T>
+impl<T> fmt::Debug for ReceiveStatus<T>
 where
     T: Message,
 {
@@ -267,7 +267,7 @@ where
         &self,
         topic: String,
         timeout: Option<Duration>,
-    ) -> RecieveStatus<T> {
+    ) -> ReceiveStatus<T> {
         let timeout = TimeoutStamp::new(min(
             timeout.unwrap_or(self.default_timeout),
             self.max_timeout,
@@ -286,12 +286,12 @@ where
                 Ok(status) => status,
                 Err(_) => {
                     warn!("Receive failed (result sender dropped)");
-                    RecieveStatus::InternalError
+                    ReceiveStatus::InternalError
                 }
             },
             Err(_) => {
                 warn!("Send failed");
-                RecieveStatus::InternalError
+                ReceiveStatus::InternalError
             }
         };
         event!(Level::INFO, result = ?result);
@@ -344,7 +344,7 @@ mod tests {
             connection
                 .receive_message("greetings".to_string(), None)
                 .await,
-            RecieveStatus::Received("hello, world".to_string())
+            ReceiveStatus::Received("hello, world".to_string())
         )
     }
 
@@ -378,7 +378,7 @@ mod tests {
                 connection
                     .receive_message("greetings".to_string(), None)
                     .await,
-                RecieveStatus::Received(format!("Hello, {}", i))
+                ReceiveStatus::Received(format!("Hello, {}", i))
             )
         }
         for i in 1..2 {
@@ -386,7 +386,7 @@ mod tests {
                 connection
                     .receive_message("farewells".to_string(), None)
                     .await,
-                RecieveStatus::Received(format!("Goodbye, {}", i))
+                ReceiveStatus::Received(format!("Goodbye, {}", i))
             )
         }
     }
@@ -420,7 +420,7 @@ mod tests {
                         Some(Duration::from_secs(15)),
                     )
                     .await,
-                RecieveStatus::Received(format!("message {}", i))
+                ReceiveStatus::Received(format!("message {}", i))
             )
         }
     }
@@ -460,7 +460,7 @@ mod tests {
                 connection
                     .receive_message("greetings".to_string(), None)
                     .await,
-                RecieveStatus::Received(format!("Hello, {}", i))
+                ReceiveStatus::Received(format!("Hello, {}", i))
             )
         }
         for i in 1..2 {
@@ -468,7 +468,7 @@ mod tests {
                 connection
                     .receive_message("farewells".to_string(), None)
                     .await,
-                RecieveStatus::Received(format!("Goodbye, {}", i))
+                ReceiveStatus::Received(format!("Goodbye, {}", i))
             )
         }
     }
@@ -507,7 +507,7 @@ mod tests {
                 .receive_message("topic".to_string(), Some(Duration::from_millis(1)))
                 .await
         });
-        assert_eq!(receive_result.await.unwrap(), RecieveStatus::Timeout);
+        assert_eq!(receive_result.await.unwrap(), ReceiveStatus::Timeout);
     }
 
     #[tokio::test]
@@ -535,7 +535,7 @@ mod tests {
                 .receive_message("topic".to_string(), Some(Duration::from_millis(10)))
                 .await
         });
-        assert_eq!(receive_result.await.unwrap(), RecieveStatus::Timeout);
+        assert_eq!(receive_result.await.unwrap(), ReceiveStatus::Timeout);
     }
 
     #[tokio::test]
@@ -565,7 +565,7 @@ mod tests {
         time::advance(Duration::from_secs(2)).await;
         assert_eq!(
             connection.receive_message("topic".to_string(), None).await,
-            RecieveStatus::Received("remember".to_string())
+            ReceiveStatus::Received("remember".to_string())
         )
     }
 
@@ -601,7 +601,7 @@ mod tests {
         for _ in 1..5_000 {
             assert_eq!(
                 connection.receive_message("topic".to_string(), None).await,
-                RecieveStatus::Received("remember".to_string())
+                ReceiveStatus::Received("remember".to_string())
             )
         }
     }

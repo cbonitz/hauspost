@@ -10,7 +10,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    exchange::{Message, RecieveStatus, SendStatus},
+    exchange::{Message, ReceiveStatus, SendStatus},
     queue::{RespondWith, RespondWithTimeout},
 };
 
@@ -23,14 +23,14 @@ where
     pub id: Uuid,
     pub queue: String,
     pub timeout: TimeoutStamp,
-    pub(crate) response_sender: DebugIgnore<Option<oneshot::Sender<RecieveStatus<T>>>>,
+    pub(crate) response_sender: DebugIgnore<Option<oneshot::Sender<ReceiveStatus<T>>>>,
 }
 
 impl<T> RequestReceive<T>
 where
     T: Message,
 {
-    pub fn new(queue: String, timeout: TimeoutStamp) -> (Receiver<RecieveStatus<T>>, Self) {
+    pub fn new(queue: String, timeout: TimeoutStamp) -> (Receiver<ReceiveStatus<T>>, Self) {
         let (response_sender, receiver) = oneshot::channel();
         let id = Uuid::new_v4();
         let request = Self {
@@ -43,7 +43,7 @@ where
     }
 
     #[tracing::instrument(skip(self), fields(request_id = %self.id))]
-    fn reply(&mut self, status: RecieveStatus<T>) {
+    fn reply(&mut self, status: ReceiveStatus<T>) {
         if let Some(sender) = self.response_sender.0.take() {
             match sender.send(status) {
                 Ok(_) => {}
@@ -63,7 +63,7 @@ where
     #[tracing::instrument(skip(self, message), fields(request_id = %self.id, message_id=%message.id))]
     fn respond_with(mut self, mut message: RequestSend<T>) {
         message.reply(SendStatus::Delivered);
-        self.reply(RecieveStatus::Received(message.message.0));
+        self.reply(ReceiveStatus::Received(message.message.0));
     }
 }
 
@@ -72,7 +72,7 @@ where
     T: Message,
 {
     fn respond_with_timeout(mut self) {
-        self.reply(RecieveStatus::Timeout);
+        self.reply(ReceiveStatus::Timeout);
     }
 }
 
