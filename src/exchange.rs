@@ -208,7 +208,6 @@ where
 }
 
 /// A cloneable connection that clients can use to interact with a [MessageExchange]
-#[derive(Clone)]
 pub struct MessageExchangeConnection<T>
 where
     T: Message,
@@ -216,6 +215,18 @@ where
     request_sender: mpsc::UnboundedSender<Request<T>>,
     default_timeout: Duration,
     max_timeout: Duration,
+}
+impl<T> Clone for MessageExchangeConnection<T>
+where
+    T: Message,
+{
+    fn clone(&self) -> Self {
+        Self {
+            request_sender: self.request_sender.clone(),
+            default_timeout: self.default_timeout.clone(),
+            max_timeout: self.max_timeout.clone(),
+        }
+    }
 }
 
 impl<T> MessageExchangeConnection<T>
