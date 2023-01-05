@@ -93,7 +93,7 @@ impl<T> RequestSend<T>
 where
     T: Message,
 {
-    pub fn new(
+    pub(crate) fn new(
         queue: String,
         timeout: TimeoutStamp,
         message: T,
@@ -118,7 +118,7 @@ where
         )
     }
     #[tracing::instrument(skip(self), fields(message_id = %self.id))]
-    pub fn reply(&mut self, status: SendStatus) {
+    pub(crate) fn reply(&mut self, status: SendStatus) {
         if let Some(sender) = self.response_sender.0.take() {
             match sender.send(status) {
                 Ok(_) => {}

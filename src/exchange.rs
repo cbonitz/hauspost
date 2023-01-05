@@ -45,11 +45,55 @@ where
 
 /// Result of a send operation
 #[derive(Debug, PartialEq, Eq)]
-pub enum SendStatus {
+pub(crate) enum SendStatus {
     /// An internal error has occured.
     InternalError,
     /// The message was delivered.
     Delivered,
+    /// The message was enqueued for delivery.
+    Enqueued,
+    /// The request has timed out.
+    Timeout,
+}
+
+impl Into<BlockingSendStatus> for SendStatus {
+    fn into(self) -> BlockingSendStatus {
+        match self {
+            SendStatus::InternalError => BlockingSendStatus::InternalError,
+            SendStatus::Delivered => BlockingSendStatus::Delivered,
+            SendStatus::Enqueued => BlockingSendStatus::InternalError,
+            SendStatus::Timeout => BlockingSendStatus::Timeout,
+        }
+    }
+}
+
+impl Into<NonblockingSendStatus> for SendStatus {
+    fn into(self) -> NonblockingSendStatus {
+        match self {
+            SendStatus::InternalError => NonblockingSendStatus::InternalError,
+            SendStatus::Delivered => NonblockingSendStatus::InternalError,
+            SendStatus::Enqueued => NonblockingSendStatus::Enqueued,
+            SendStatus::Timeout => NonblockingSendStatus::Timeout,
+        }
+    }
+}
+
+/// Result of a blocking send operation
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlockingSendStatus {
+    /// An internal error has occured.
+    InternalError,
+    /// The message was delivered.
+    Delivered,
+    /// The request has timed out.
+    Timeout,
+}
+
+/// Result of a nonblocking send operation
+#[derive(Debug, PartialEq, Eq)]
+pub enum NonblockingSendStatus {
+    /// An internal error has occured.
+    InternalError,
     /// The message was enqueued for delivery.
     Enqueued,
     /// The request has timed out.
@@ -71,9 +115,10 @@ where
     T: Message,
 {
     queues: HashMap<String, Queue<RequestReceive<T>, RequestSend<T>>>,
+    request_sender: Option<mpsc::UnboundedSender<Request<T>>>,
     request_receiver: mpsc::UnboundedReceiver<Request<T>>,
     tick_sender: mpsc::UnboundedSender<Instant>,
-    tick_receiver: Option<mpsc::UnboundedReceiver<Instant>>,
+    tick_receiver: mpsc::UnboundedReceiver<Instant>,
 }
 
 impl<T> MessageExchange<T>
@@ -84,22 +129,17 @@ where
     const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// Create a message exchange together with a [MessageExchangeConnection].
-    pub fn new() -> (MessageExchangeConnection<T>, Self) {
+    pub fn new() -> Self {
         let (request_sender, request_receiver) = mpsc::unbounded_channel();
         let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
-        (
-            MessageExchangeConnection {
-                request_sender,
-                default_timeout: Self::DEFAULT_TIMEOUT,
-                max_timeout: Self::MAX_TIMEOUT,
-            },
-            Self {
-                queues: HashMap::new(),
-                request_receiver,
-                tick_sender,
-                tick_receiver: Some(tick_receiver),
-            },
-        )
+
+        Self {
+            queues: HashMap::new(),
+            request_sender: Some(request_sender),
+            request_receiver,
+            tick_sender,
+            tick_receiver: tick_receiver,
+        }
     }
 
     #[tracing::instrument(skip(self, request), fields(request_id = %request.id, queue=%request.queue))]
@@ -170,9 +210,10 @@ where
         };
     }
 
-    /// This method needs to be running exactly once for the exchange to process requests.
+    /// Run the exchange in the background. Returns a cloneable [MessageExchangeConnection].
+    /// Background tasks will stop when the last clone of the connection is dropped.
     #[tracing::instrument(skip(self))]
-    pub async fn run(&mut self) {
+    pub fn run_in_background(mut self) -> MessageExchangeConnection<T> {
         let tick_sender = self.tick_sender.clone();
         tokio::spawn(async move {
             loop {
@@ -183,27 +224,34 @@ where
                 sleep(Duration::from_millis(10)).await;
             }
         });
-        let mut tick_receiver = self.tick_receiver.take().expect("Can only run once");
-        loop {
-            tokio::select! {
-                tick = tick_receiver.recv() => {
-                    match tick {
-                        Some(tick) => self.process_timeout_at(tick).await,
-                        None => return,
-                    }
+        let connection = MessageExchangeConnection {
+            request_sender: self.request_sender.take().unwrap(),
+            default_timeout: Self::DEFAULT_TIMEOUT,
+            max_timeout: Self::MAX_TIMEOUT,
+        };
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    tick = self.tick_receiver.recv() => {
+                        match tick {
+                            Some(tick) => self.process_timeout_at(tick).await,
+                            None => return,
+                        }
 
-                }
-                message = self.request_receiver.recv() => {
-                    match message {
-                        Some(request) => self.process_request(request).await,
-                        None => {
-                            info!("all connections dropped");
-                            return;
+                    }
+                    message = self.request_receiver.recv() => {
+                        match message {
+                            Some(request) => self.process_request(request).await,
+                            None => {
+                                info!("all connections dropped");
+                                return;
+                            }
                         }
                     }
                 }
             }
-        }
+        });
+        connection
     }
 }
 
@@ -233,13 +281,42 @@ impl<T> MessageExchangeConnection<T>
 where
     T: Message,
 {
-    /// Send `message` to `topic`.
+    /// Send `message` to `topic` in a blocking fashion.
     ///
-    /// * If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
-    /// * `block` sets the blocking behavior:
-    ///   * If it is set to `true`, the method will return when the message was delivered , has timed out or an error occured.
-    ///   * If it is set to `false`, the method will return when the message was enqueued, or an error has occured doing so.
-    pub async fn send_message(
+    /// The method will return when the message was delivered, the operation has timed out or an error occured and return the corresponding [BlockingSendStatus].
+    /// If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
+    ///
+    /// Messages from subsequent calls to this function on the same connection will be delivered in-order.
+    pub async fn send_message_blocking(
+        &self,
+        message: T,
+        topic: String,
+        timeout: Option<Duration>,
+    ) -> BlockingSendStatus {
+        self.send_message_internal(message, topic, true, timeout)
+            .await
+            .into()
+    }
+
+    /// Send `message` to `topic` in a nonblocking fashion.
+    ///
+    /// The method will return when the message was enqueued, or an error has occured doing so.
+    /// After the timeout, the message will be discarded.
+    /// If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
+    ///
+    /// Messages from subsequent calls to this function on the same connection will be delivered in-order.
+    pub async fn send_message_nonblocking(
+        &self,
+        message: T,
+        topic: String,
+        timeout: Option<Duration>,
+    ) -> BlockingSendStatus {
+        self.send_message_internal(message, topic, false, timeout)
+            .await
+            .into()
+    }
+
+    async fn send_message_internal(
         &self,
         message: T,
         topic: String,
@@ -334,23 +411,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_receive_single() {
+    async fn test_send_receive_single_message() {
         initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
+        let connection = MessageExchange::<String>::new().run_in_background();
         let send_connection = connection.clone();
+
         tokio::spawn(async move {
             send_connection
-                .send_message(
-                    "hello, world".to_string(),
-                    "greetings".to_string(),
-                    true,
-                    None,
-                )
+                .send_message_blocking("hello, world".to_string(), "greetings".to_string(), None)
                 .await;
         });
+
         assert_eq!(
             connection
                 .receive_message("greetings".to_string(), None)
@@ -359,70 +430,26 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_send_receive_multiple() {
-        initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
-        let send_connection = connection.clone();
-        tokio::spawn(async move {
-            for i in 1..2 {
-                send_connection
-                    .send_message(format!("Hello, {}", i), "greetings".to_string(), true, None)
-                    .await;
-            }
-            for i in 1..2 {
-                send_connection
-                    .send_message(
-                        format!("Goodbye, {}", i),
-                        "farewells".to_string(),
-                        true,
-                        None,
-                    )
-                    .await;
-            }
-        });
-        for i in 1..2 {
-            assert_eq!(
-                connection
-                    .receive_message("greetings".to_string(), None)
-                    .await,
-                ReceiveStatus::Received(format!("Hello, {}", i))
-            )
-        }
-        for i in 1..2 {
-            assert_eq!(
-                connection
-                    .receive_message("farewells".to_string(), None)
-                    .await,
-                ReceiveStatus::Received(format!("Goodbye, {}", i))
-            )
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_send_receive_large_amount() {
+    async fn test_send_receive_large_amount_of_messages_sequential() {
         initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
+        let connection = MessageExchange::<String>::new().run_in_background();
         let count = 10_000;
+
         let send_connection = connection.clone();
         tokio::spawn(async move {
             for i in 1..count {
                 send_connection
-                    .send_message(
+                    .send_message_nonblocking(
                         format!("message {}", i),
                         format!("messages {}", i % 10),
-                        false,
                         Some(Duration::from_secs(15)),
                     )
                     .await;
             }
         });
+
+        // Receive must be in-order within topic
         for i in 1..count {
             assert_eq!(
                 connection
@@ -437,35 +464,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_receive_multiple_nonblocking() {
+    async fn test_send_receive_multiple_messages_with_nonblocking_send() {
         initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
-        let send_connection = connection.clone();
+        let connection = MessageExchange::<String>::new().run_in_background();
+
+        let send_connection_1 = connection.clone();
         tokio::spawn(async move {
             for i in 1..2 {
-                send_connection
-                    .send_message(
+                send_connection_1
+                    .send_message_nonblocking(
                         format!("Goodbye, {}", i),
                         "farewells".to_string(),
-                        false,
-                        None,
-                    )
-                    .await;
-            }
-            for i in 1..2 {
-                send_connection
-                    .send_message(
-                        format!("Hello, {}", i),
-                        "greetings".to_string(),
-                        false,
                         None,
                     )
                     .await;
             }
         });
+        let send_connection_2 = connection.clone();
+        tokio::spawn(async move {
+            for i in 1..2 {
+                send_connection_2
+                    .send_message_nonblocking(
+                        format!("Hello, {}", i),
+                        "greetings".to_string(),
+                        None,
+                    )
+                    .await;
+            }
+        });
+
+        // Receive must be in-order within topic
         for i in 1..2 {
             assert_eq!(
                 connection
@@ -485,61 +513,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_timeout_status_send() {
+    async fn test_send_timeout() {
         initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
+        let connection = MessageExchange::<String>::new().run_in_background();
 
         let send_result = tokio::spawn(async move {
             connection
-                .send_message(
-                    "forget".to_string(),
+                .send_message_blocking(
+                    "should time out".to_string(),
                     "topic".to_string(),
-                    true,
                     Some(Duration::from_millis(1)),
                 )
                 .await
         });
-        assert_eq!(send_result.await.unwrap(), SendStatus::Timeout);
+
+        assert_eq!(send_result.await.unwrap(), BlockingSendStatus::Timeout);
     }
 
     #[tokio::test]
-    async fn test_timeout_status_receive() {
+    async fn test_receive_timeout() {
         initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
+        let connection = MessageExchange::<String>::new().run_in_background();
 
         let receive_result = tokio::spawn(async move {
             connection
                 .receive_message("topic".to_string(), Some(Duration::from_millis(1)))
                 .await
         });
+
         assert_eq!(receive_result.await.unwrap(), ReceiveStatus::Timeout);
     }
 
     #[tokio::test]
-    async fn test_timeout_status_send_receive() {
+    async fn test_subsequent_send_and_receive_timeouts() {
         initialize_logger();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
+        let connection = MessageExchange::<String>::new().run_in_background();
+
         let send_connection = connection.clone();
         let send_result = tokio::spawn(async move {
             send_connection
-                .send_message(
-                    "forget".to_string(),
+                .send_message_blocking(
+                    "should time out".to_string(),
                     "topic".to_string(),
-                    true,
                     Some(Duration::from_millis(1)),
                 )
                 .await
         });
-        assert_eq!(send_result.await.unwrap(), SendStatus::Timeout);
+        assert_eq!(send_result.await.unwrap(), BlockingSendStatus::Timeout);
 
         let receive_result = tokio::spawn(async move {
             connection
@@ -550,69 +570,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_timeout() {
+    async fn test_one_message_timed_out_one_message_received() {
         initialize_logger();
         time::pause();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
+        let connection = MessageExchange::<String>::new().run_in_background();
+
         connection
-            .send_message(
-                "forget".to_string(),
+            .send_message_nonblocking(
+                "should time out".to_string(),
                 "topic".to_string(),
-                false,
                 Some(Duration::from_secs(1)),
             )
             .await;
         connection
-            .send_message(
-                "remember".to_string(),
+            .send_message_nonblocking(
+                "should be received".to_string(),
                 "topic".to_string(),
-                false,
                 Some(Duration::from_secs(3)),
             )
             .await;
+
         time::advance(Duration::from_secs(2)).await;
         assert_eq!(
             connection.receive_message("topic".to_string(), None).await,
-            ReceiveStatus::Received("remember".to_string())
+            ReceiveStatus::Received("should be received".to_string())
         )
     }
 
     #[tokio::test]
-    async fn test_send_timeout_multiple() {
+    async fn test_send_timeout_many_messages_before_delivering_many() {
         initialize_logger();
         time::pause();
-        let (connection, mut exchange) = MessageExchange::<String>::new();
-        tokio::spawn(async move {
-            exchange.run().await;
-        });
-        for _ in 1..5_000 {
+        let connection = MessageExchange::<String>::new().run_in_background();
+        let count = 5_000;
+
+        for _ in 1..count {
             connection
-                .send_message(
-                    "forget".to_string(),
+                .send_message_nonblocking(
+                    "should time out".to_string(),
                     "topic".to_string(),
-                    false,
                     Some(Duration::from_secs(1)),
                 )
                 .await;
         }
-        for _ in 1..5_000 {
+        for i in 1..count {
             connection
-                .send_message(
-                    "remember".to_string(),
+                .send_message_nonblocking(
+                    format!("should be received {}", i),
                     "topic".to_string(),
-                    false,
                     Some(Duration::from_secs(3)),
                 )
                 .await;
         }
+
+        // Receive must be in-order within topic
         time::advance(Duration::from_secs(2)).await;
-        for _ in 1..5_000 {
+        for i in 1..count {
             assert_eq!(
                 connection.receive_message("topic".to_string(), None).await,
-                ReceiveStatus::Received("remember".to_string())
+                ReceiveStatus::Received(format!("should be received {}", i).to_string())
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timed_out_messages_interleaved_with_non_timed_out_messages() {
+        initialize_logger();
+        time::pause();
+        let connection = MessageExchange::<String>::new().run_in_background();
+        let count = 5_000;
+
+        for i in 1..count {
+            connection
+                .send_message_nonblocking(
+                    "should time out".to_string(),
+                    "topic".to_string(),
+                    Some(Duration::from_secs(1)),
+                )
+                .await;
+            connection
+                .send_message_nonblocking(
+                    format!("should be received {}", i),
+                    "topic".to_string(),
+                    Some(Duration::from_secs(3)),
+                )
+                .await;
+        }
+
+        // Receive must be in-order within topic
+        time::advance(Duration::from_secs(2)).await;
+        for i in 1..count {
+            assert_eq!(
+                connection.receive_message("topic".to_string(), None).await,
+                ReceiveStatus::Received(format!("should be received {}", i).to_string())
             )
         }
     }
