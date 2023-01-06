@@ -1,7 +1,10 @@
-//! Simple topic-based in-process message exchange for use in [Tokio](https://tokio.rs/) applications.
+//! This is a simple topic-based in-process message exchange for use in [Tokio](https://tokio.rs/) applications.
+//! It is intended for use-cases where it is convenient to use the communication patterns provided by a message broker,
+//! but persistence and state shared across multiple instances of a program are not required.
 //!
-//! # Usage Example
-//! Pass data between requests based on dynamic request attributes to create a location-based service.
+//! ## Usage Example
+//!
+//! In this toy example, we pass data between requests based on dynamic request attributes to create a location-based service.
 //! ```rust
 //! #
 //! # tokio_test::block_on(async {
@@ -35,6 +38,7 @@
 //!     response
 //! }
 //!
+//! // Simulate making requests in a typical Rust web framework using Connection as shared state.
 //! assert_eq!(
 //!     location_based_service(
 //!         &connection,
