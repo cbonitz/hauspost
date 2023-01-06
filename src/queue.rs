@@ -5,7 +5,7 @@ use std::{
 };
 
 use tokio::time::Instant;
-use tracing::{event, Level};
+use tracing::{event, warn, Level};
 use uuid::Uuid;
 
 /// The ability to respond with a response of type `T`
@@ -18,6 +18,16 @@ pub trait RespondWithTimeout {
     fn respond_with_timeout(self);
 }
 
+pub enum SubscriptionDelivery<T> {
+    DeliveryAccepted,
+    ExpiredSubscriptionCannotDeliver(T),
+}
+
+/// A subscription
+pub trait Subscription<T> {
+    fn try_deliver(&mut self, response: T) -> SubscriptionDelivery<T>;
+}
+
 /// Status of a queue
 #[derive(Eq, PartialEq, Debug)]
 pub enum QueueStatus {
@@ -25,6 +35,11 @@ pub enum QueueStatus {
     Empty,
     /// The queue is nonempty
     Nonempty,
+}
+
+enum QueueItem<Subscription, RequestSingleReceive> {
+    Subscription(Subscription),
+    RequestSingleReceive(RequestSingleReceive),
 }
 
 /// A queue abstraction that will match requests of type `Req` to responses of type `Msg` in a FIFO matter.
@@ -39,23 +54,26 @@ pub enum QueueStatus {
 /// The following invariant is maintained after each possible operation:
 /// 1. Both the send and receive request queues are either empty, or their head is a non-expired request, i.e. the request is still in the corresponding HashMap.
 /// 2. At most one of the two queues is nonempty.
-pub struct Queue<Req, Msg>
+pub struct Queue<Subscription, RequestSingleReceive, Msg>
 where
-    Req: RespondWith<Msg>,
+    Msg: RespondWithTimeout,
+    Subscription: crate::queue::Subscription<Msg>,
+    RequestSingleReceive: RespondWith<Msg> + RespondWithTimeout,
 {
     name: String,
     receive_request_queue: VecDeque<Uuid>,
     receive_request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
-    receive_requests: HashMap<Uuid, Req>,
+    receive_requests: HashMap<Uuid, QueueItem<Subscription, RequestSingleReceive>>,
     message_request_queue: VecDeque<Uuid>,
     message_request_timeouts: BinaryHeap<Reverse<(Instant, Uuid)>>,
     message_requests: HashMap<Uuid, Msg>,
 }
 
-impl<'a, 'b, Req, Msg> Queue<Req, Msg>
+impl<Subscription, RequestSingleReceive, Msg> Queue<Subscription, RequestSingleReceive, Msg>
 where
     Msg: RespondWithTimeout,
-    Req: RespondWith<Msg> + RespondWithTimeout,
+    Subscription: crate::queue::Subscription<Msg>,
+    RequestSingleReceive: RespondWith<Msg> + RespondWithTimeout,
 {
     /// Creates a queue
     pub fn new(name: &str) -> Self {
@@ -107,10 +125,26 @@ where
         }
     }
 
+    fn pop_front<T>(queue: &mut VecDeque<Uuid>, map: &mut HashMap<Uuid, T>) -> Option<(Uuid, T)> {
+        loop {
+            match queue.pop_front() {
+                Some(id) => match map.remove(&id) {
+                    Some(request) => return Some((id, request)),
+                    None => continue,
+                },
+                None => return None,
+            }
+        }
+    }
+
+    fn push_front<T>(queue: &mut VecDeque<Uuid>, map: &mut HashMap<Uuid, T>, id: Uuid, request: T) {
+        queue.push_front(id.clone());
+        map.insert(id, request);
+    }
+
     /// Try to match a request to a response after a send or receive request was enqueued.
     /// This method directly ensures invariant 2, and invariant 1 by calling another method,
     /// so it needs to be called after every send or receive operation.
-    #[tracing::instrument(skip(self), fields(queue=self.name))]
     fn make_match(&mut self) -> QueueStatus {
         if self.receive_request_queue.is_empty() && self.message_request_queue.is_empty() {
             return QueueStatus::Empty;
@@ -118,28 +152,51 @@ where
         if self.receive_request_queue.is_empty() || self.message_request_queue.is_empty() {
             return QueueStatus::Nonempty;
         }
-        let rcv_req_id = self
-            .receive_request_queue
-            .pop_front()
-            .expect("No empty request queue should ever be in requests map");
-        let request = self
-            .receive_requests
-            .remove(&rcv_req_id)
-            .expect("Queues and request lists must match");
-        let msg_req_id = self
-            .message_request_queue
-            .pop_front()
-            .expect("No empty request queue should ever be in requests map");
-        let message = self
-            .message_requests
-            .remove(&msg_req_id)
-            .expect("Queues and message lists must match");
-        request.respond_with(message);
+        let (msg_req_id, mut send_message) =
+            Self::pop_front(&mut self.message_request_queue, &mut self.message_requests)
+                .expect("Requests cannot be empty at this point");
+        loop {
+            match Self::pop_front(&mut self.receive_request_queue, &mut self.receive_requests) {
+                Some((request_id, request)) => {
+                    match request {
+                        QueueItem::Subscription(mut subscription) => {
+                            match subscription.try_deliver(send_message) {
+                                SubscriptionDelivery::DeliveryAccepted => {
+                                    Self::push_front(
+                                        &mut self.receive_request_queue,
+                                        &mut self.receive_requests,
+                                        request_id,
+                                        QueueItem::Subscription(subscription),
+                                    );
+                                    break;
+                                }
+                                SubscriptionDelivery::ExpiredSubscriptionCannotDeliver(message) => {
+                                    send_message = message
+                                }
+                            }
+                        }
+                        QueueItem::RequestSingleReceive(request) => {
+                            request.respond_with(send_message);
+                            break;
+                        }
+                    };
+                }
+                None => {
+                    Self::push_front(
+                        &mut self.message_request_queue,
+                        &mut self.message_requests,
+                        msg_req_id,
+                        send_message,
+                    );
+                    break;
+                }
+            }
+        }
+
         self.remove_requests_without_id()
     }
 
     /// Process potential timeouts at instant `now`.
-    #[tracing::instrument(skip(self), fields(queue=self.name))]
     pub fn process_timeout_at(&mut self, now: Instant) -> QueueStatus {
         loop {
             let timed_out = self
@@ -167,7 +224,10 @@ where
                 let Reverse((_, id)) = self.receive_request_timeouts.pop().unwrap();
                 event!(Level::INFO, rcv_req_id = id.to_string(), "request_timeout");
                 if let Some(sender) = self.receive_requests.remove(&id) {
-                    sender.respond_with_timeout();
+                    match sender {
+                        QueueItem::Subscription(_) => warn!("Subscriptions should not time out."),
+                        QueueItem::RequestSingleReceive(sender) => sender.respond_with_timeout(),
+                    };
                 }
             } else {
                 break;
@@ -178,11 +238,17 @@ where
 
     /// Process a receive request.
     #[tracing::instrument(skip(self, receive_request), fields(queue=self.name, rcv_req_id=%id))]
-    pub fn receive(&mut self, receive_request: Req, id: Uuid, timeout_at: Instant) -> QueueStatus {
+    pub fn receive(
+        &mut self,
+        receive_request: RequestSingleReceive,
+        id: Uuid,
+        timeout_at: Instant,
+    ) -> QueueStatus {
         self.receive_request_queue.push_back(id.clone());
         self.receive_request_timeouts
             .push(Reverse((timeout_at, id.clone())));
-        self.receive_requests.insert(id, receive_request);
+        self.receive_requests
+            .insert(id, QueueItem::RequestSingleReceive(receive_request));
         self.make_match()
     }
 
@@ -195,6 +261,15 @@ where
         self.message_requests.insert(id, message_request);
         self.make_match()
     }
+
+    /// Process a subscription.
+    #[tracing::instrument(skip(self, subscription), fields(queue=self.name, msg_req_id=%id))]
+    pub fn subscribe(&mut self, subscription: Subscription, id: Uuid) -> QueueStatus {
+        self.receive_request_queue.push_back(id.clone());
+        self.receive_requests
+            .insert(id, QueueItem::Subscription(subscription));
+        self.make_match()
+    }
 }
 
 #[cfg(test)]
@@ -202,17 +277,21 @@ mod tests {
     use super::{Queue, QueueStatus};
     use crate::{
         exchange::{Message, ReceiveStatus, SendStatus},
-        requests::{RequestReceive, RequestSend, TimeoutStamp},
+        requests::{MessageSubscription, RequestReceive, RequestSend, TimeoutStamp},
     };
     use distinct_permutations::distinct_permutations;
     use itertools::Itertools;
     use std::cmp::Ord;
     use std::{env, iter::repeat, sync::Once, time::Duration};
-    use tokio::{sync::oneshot, time};
+    use tokio::{
+        sync::{mpsc, oneshot},
+        time::{self, Instant},
+    };
     use tracing_subscriber::fmt::format::FmtSpan;
 
-    static INITIALIZE_LOGGER: Once = Once::new();
+    const DEFAULT_QUEUE_NAME: &str = "foo";
 
+    static INITIALIZE_LOGGER: Once = Once::new();
     fn initialize_logger() {
         if let Ok(val) = env::var("TRACE_TESTS") {
             if val == "1" {
@@ -225,18 +304,21 @@ mod tests {
         }
     }
 
-    fn q() -> Queue<RequestReceive<u64>, RequestSend<u64>> {
-        Queue::new("foo")
+    fn q() -> Queue<MessageSubscription<u64>, RequestReceive<u64>, RequestSend<u64>> {
+        Queue::new(DEFAULT_QUEUE_NAME)
     }
 
     const TIMEOUT: Duration = Duration::from_millis(1);
 
     fn receive() -> (oneshot::Receiver<ReceiveStatus<u64>>, RequestReceive<u64>) {
-        RequestReceive::new("foo".to_string(), TimeoutStamp::new(TIMEOUT.clone()))
+        RequestReceive::new(
+            DEFAULT_QUEUE_NAME.to_string(),
+            TimeoutStamp::new(TIMEOUT.clone()),
+        )
     }
     fn send(message: u64) -> (oneshot::Receiver<SendStatus>, RequestSend<u64>) {
         let (receiver, request) = RequestSend::new(
-            "foo".to_string(),
+            DEFAULT_QUEUE_NAME.to_string(),
             TimeoutStamp::new(TIMEOUT.clone()),
             message,
             true,
@@ -244,7 +326,7 @@ mod tests {
         (receiver.unwrap(), request)
     }
 
-    impl<T> Queue<RequestReceive<T>, RequestSend<T>>
+    impl<T> Queue<MessageSubscription<T>, RequestReceive<T>, RequestSend<T>>
     where
         T: Message,
     {
@@ -258,6 +340,14 @@ mod tests {
             let timeout_at = request.timeout.timeout_at.clone();
             let send_id = request.id.clone();
             self.send(request, send_id, timeout_at)
+        }
+
+        pub fn send_subscribe_request(
+            &mut self,
+            subscription: MessageSubscription<T>,
+        ) -> QueueStatus {
+            let subscription_id = subscription.id.clone();
+            self.subscribe(subscription, subscription_id)
         }
     }
 
@@ -361,5 +451,32 @@ mod tests {
         for permutation in distinct_permutations(steps) {
             send_then_receive_interleaved(number_of_pairs, permutation).await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_receive_then_cancel() {
+        initialize_logger();
+        time::pause();
+        let mut q = q();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (cancel, subscription) =
+            MessageSubscription::new(DEFAULT_QUEUE_NAME.to_string(), sender);
+        let (send_status_receiver_1, send_request_1) = send(1);
+        let (send_status_receiver_2, send_request_2) = send(2);
+        let (send_status_receiver_3, send_request_3) = send(3);
+
+        q.send_subscribe_request(subscription);
+        q.send_send_request(send_request_1);
+        assert_send_received(send_status_receiver_1).await;
+        assert_eq!(receiver.recv().await.unwrap(), 1);
+        q.send_send_request(send_request_2);
+        assert_send_received(send_status_receiver_2).await;
+        assert_eq!(receiver.recv().await.unwrap(), 2);
+        cancel.cancel();
+        q.send_send_request(send_request_3);
+        time::advance(TIMEOUT * 2).await;
+        q.process_timeout_at(Instant::now());
+        assert_eq!(send_status_receiver_3.await.unwrap(), SendStatus::Timeout);
+        assert!(receiver.recv().await.is_none());
     }
 }

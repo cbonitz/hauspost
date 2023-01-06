@@ -9,7 +9,7 @@ use tracing::{event, info, span, warn, Level};
 
 use crate::{
     queue::{Queue, QueueStatus},
-    requests::{RequestReceive, RequestSend, TimeoutStamp},
+    requests::{MessageSubscription, RequestReceive, RequestSend, TimeoutStamp},
 };
 
 /// Requirements for messages
@@ -114,7 +114,7 @@ pub struct MessageExchange<T>
 where
     T: Message,
 {
-    queues: HashMap<String, Queue<RequestReceive<T>, RequestSend<T>>>,
+    queues: HashMap<String, Queue<MessageSubscription<T>, RequestReceive<T>, RequestSend<T>>>,
     request_sender: Option<mpsc::UnboundedSender<Request<T>>>,
     request_receiver: mpsc::UnboundedReceiver<Request<T>>,
     tick_sender: mpsc::UnboundedSender<Instant>,

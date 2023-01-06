@@ -1,17 +1,20 @@
 //! Requests and responses used in the message exchange.
-use std::time::Duration;
-
 use debug_ignore::DebugIgnore;
+use std::time::Duration;
 use tokio::{
-    sync::oneshot::{self, Receiver},
+    sync::{
+        mpsc::{error::SendError, UnboundedSender},
+        oneshot::{self, Receiver},
+    },
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     exchange::{Message, ReceiveStatus, SendStatus},
-    queue::{RespondWith, RespondWithTimeout},
+    queue::{RespondWith, RespondWithTimeout, Subscription, SubscriptionDelivery},
 };
 
 /// Request to receive a message.
@@ -63,7 +66,7 @@ where
     #[tracing::instrument(skip(self, message), fields(request_id = %self.id, message_id=%message.id))]
     fn respond_with(mut self, mut message: RequestSend<T>) {
         message.reply(SendStatus::Delivered);
-        self.reply(ReceiveStatus::Received(message.message.0));
+        self.reply(ReceiveStatus::Received(message.consume()));
     }
 }
 
@@ -86,7 +89,7 @@ where
     pub queue: String,
     pub timeout: TimeoutStamp,
     pub(crate) response_sender: DebugIgnore<Option<oneshot::Sender<SendStatus>>>,
-    pub(crate) message: DebugIgnore<T>,
+    message: DebugIgnore<Option<T>>,
 }
 
 impl<T> RequestSend<T>
@@ -113,7 +116,7 @@ where
                 queue,
                 timeout,
                 response_sender: DebugIgnore(response_sender),
-                message: DebugIgnore(message),
+                message: DebugIgnore(Some(message)),
             },
         )
     }
@@ -129,6 +132,36 @@ where
             }
         }
     }
+
+    pub(crate) fn take(mut self) -> (T, EmptyRequestSend<T>) {
+        let payload = self.message.take().unwrap();
+        (payload, EmptyRequestSend { request: self })
+    }
+
+    pub(crate) fn consume(mut self) -> T {
+        self.message.take().unwrap()
+    }
+}
+
+pub(crate) struct EmptyRequestSend<T>
+where
+    T: Message,
+{
+    request: RequestSend<T>,
+}
+
+impl<T> EmptyRequestSend<T>
+where
+    T: Message,
+{
+    pub(crate) fn with_message(mut self, payload: T) -> RequestSend<T> {
+        self.request.message.replace(payload);
+        self.request
+    }
+
+    pub(crate) fn reply(mut self, status: SendStatus) {
+        self.request.reply(status);
+    }
 }
 
 impl<T> RespondWithTimeout for RequestSend<T>
@@ -137,6 +170,53 @@ where
 {
     fn respond_with_timeout(mut self) {
         self.reply(SendStatus::Timeout);
+    }
+}
+
+pub struct MessageSubscription<T>
+where
+    T: Message,
+{
+    pub id: Uuid,
+    pub queue: String,
+    sender: UnboundedSender<T>,
+    cancellation_token: CancellationToken,
+}
+
+impl<T> MessageSubscription<T>
+where
+    T: Message,
+{
+    pub fn new(queue: String, sender: UnboundedSender<T>) -> (CancellationToken, Self) {
+        let token = CancellationToken::new();
+        let result = Self {
+            id: Uuid::new_v4(),
+            queue,
+            sender,
+            cancellation_token: token.clone(),
+        };
+        (token, result)
+    }
+}
+
+impl<T> Subscription<RequestSend<T>> for MessageSubscription<T>
+where
+    T: Message,
+{
+    fn try_deliver(&mut self, response: RequestSend<T>) -> SubscriptionDelivery<RequestSend<T>> {
+        if self.cancellation_token.is_cancelled() {
+            return SubscriptionDelivery::ExpiredSubscriptionCannotDeliver(response);
+        }
+        let (response, empty_request) = response.take();
+        match self.sender.send(response) {
+            Ok(()) => {
+                empty_request.reply(SendStatus::Delivered);
+                SubscriptionDelivery::DeliveryAccepted
+            }
+            Err(SendError(message)) => SubscriptionDelivery::ExpiredSubscriptionCannotDeliver(
+                empty_request.with_message(message),
+            ),
+        }
     }
 }
 
