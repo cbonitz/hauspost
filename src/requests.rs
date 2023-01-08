@@ -173,6 +173,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct MessageSubscription<T>
 where
     T: Message,

@@ -4,13 +4,14 @@
 //!
 //! ## Usage Example
 //!
-//! In this toy example, we pass data between requests based on dynamic request attributes to create a location-based service.
+//! In this contrived toy example, simulate passing data between requests based on dynamic request attributes, and between requests to a background proess
+//! to create useless location-based service with a visitor counter.
 //! ```rust
 //! #
 //! # tokio_test::block_on(async {
 //! # use message_exchange::exchange::{MessageExchange, MessageExchangeConnection, ReceiveStatus};
 //! # use tokio::time::Duration;
-//! let connection = MessageExchange::new().run_in_background();
+//! let mut connection = MessageExchange::new().run_in_background();
 //! async fn location_based_service(
 //!     connection: &MessageExchangeConnection<String>,
 //!     location: String,
@@ -35,9 +36,12 @@
 //!     connection
 //!         .send_message_nonblocking(user_name, location, Some(Duration::from_secs(10)))
 //!         .await;
+//!     connection
+//!         .send_message_nonblocking("anonymized".to_string(), "__user_counter".to_string(), Some(Duration::from_secs(10)))
+//!         .await;
 //!     response
 //! }
-//!
+//! connection.subscribe("__user_counter".to_string());
 //! // Simulate making requests in a typical Rust web framework using Connection as shared state.
 //! assert_eq!(
 //!     location_based_service(
@@ -54,6 +58,14 @@
 //!         .await,
 //!     "Alice was here."
 //! );
+//!
+//! let mut visitor_counter = 0;
+//! while let Ok(Some(_)) = connection
+//!     .subscriptions_recv(Duration::from_millis(10))
+//!     .await {
+//!     visitor_counter += 1;
+//! }
+//! assert_eq!(visitor_counter, 2);
 //! # });
 //! ```
 pub mod exchange;

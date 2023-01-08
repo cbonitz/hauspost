@@ -1,10 +1,11 @@
 //! The message exchange and its connection.
+use anyhow::anyhow;
 use std::{cmp::min, collections::HashMap, fmt, time::Duration};
-
 use tokio::{
     sync::mpsc,
-    time::{sleep, Instant},
+    time::{self, error::Elapsed, sleep, Instant},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{event, info, span, warn, Level};
 
 use crate::{
@@ -107,6 +108,7 @@ where
 {
     Receive(RequestReceive<T>),
     Send(RequestSend<T>),
+    Subscribe(MessageSubscription<T>),
 }
 
 /// A simple queue-based message exchange.
@@ -182,6 +184,22 @@ where
         }
     }
 
+    #[tracing::instrument(skip(self, request), fields(request_id = %request.id, queue=%request.queue))]
+    fn subscribe(&mut self, request: MessageSubscription<T>) {
+        let queue_name = request.queue.clone();
+        let id = request.id.clone();
+        match self.queues.get_mut(&request.queue) {
+            Some(queue) => {
+                queue.subscribe(request, id);
+            }
+            None => {
+                let mut queue = Queue::new(&request.queue);
+                queue.subscribe(request, id);
+                self.queues.insert(queue_name, queue);
+            }
+        }
+    }
+
     #[tracing::instrument(skip(self))]
     async fn process_timeout_at(&mut self, now: Instant) {
         let mut remove = vec![];
@@ -207,7 +225,8 @@ where
                 self.process_timeout_at(message.timeout.created_at).await;
                 self.send(message).await
             }
-        };
+            Request::Subscribe(request) => self.subscribe(request),
+        }
     }
 
     /// Run the exchange in the background. Returns a cloneable [MessageExchangeConnection].
@@ -224,11 +243,11 @@ where
                 sleep(Duration::from_millis(10)).await;
             }
         });
-        let connection = MessageExchangeConnection {
-            request_sender: self.request_sender.take().unwrap(),
-            default_timeout: Self::DEFAULT_TIMEOUT,
-            max_timeout: Self::MAX_TIMEOUT,
-        };
+        let connection = MessageExchangeConnection::new(
+            self.request_sender.take().unwrap(),
+            Self::DEFAULT_TIMEOUT,
+            Self::MAX_TIMEOUT,
+        );
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -261,16 +280,45 @@ where
     T: Message,
 {
     request_sender: mpsc::UnboundedSender<Request<T>>,
+    subscription_receiver: mpsc::UnboundedReceiver<T>,
+    subscription_sender: mpsc::UnboundedSender<T>,
+    subscriptions: HashMap<String, CancellationToken>,
     default_timeout: Duration,
     max_timeout: Duration,
 }
+
+impl<T> MessageExchangeConnection<T>
+where
+    T: Message,
+{
+    fn new(
+        request_sender: mpsc::UnboundedSender<Request<T>>,
+        default_timeout: Duration,
+        max_timeout: Duration,
+    ) -> Self {
+        let (subscription_sender, subscription_receiver) = mpsc::unbounded_channel();
+        Self {
+            request_sender,
+            subscription_receiver,
+            subscription_sender,
+            subscriptions: HashMap::new(),
+            default_timeout,
+            max_timeout,
+        }
+    }
+}
+
 impl<T> Clone for MessageExchangeConnection<T>
 where
     T: Message,
 {
     fn clone(&self) -> Self {
+        let (subscription_sender, subscription_receiver) = mpsc::unbounded_channel();
         Self {
             request_sender: self.request_sender.clone(),
+            subscription_receiver,
+            subscription_sender,
+            subscriptions: HashMap::new(),
             default_timeout: self.default_timeout.clone(),
             max_timeout: self.max_timeout.clone(),
         }
@@ -385,13 +433,40 @@ where
         event!(Level::INFO, result = ?result);
         result
     }
+
+    /// Subscribe to topic. Messages will be received via an [`mpsc::UnboundedReceiver`] as long as the subscription is active.
+    /// To consume the messages, call `subscriptions_recv`.
+    ///
+    /// Currently, the subscription receiver is unbounded, so no backpressure is implemented.
+    pub fn subscribe(&mut self, topic: String) -> Result<(), anyhow::Error> {
+        let (cancel, subscription) =
+            MessageSubscription::new(topic.clone(), self.subscription_sender.clone());
+        self.request_sender
+            .send(Request::Subscribe(subscription))
+            .map_err(|_| anyhow!("could not subscribe"))?;
+        self.subscriptions.insert(topic, cancel);
+        Ok(())
+    }
+
+    /// Unsubscribe from a topic. No more messages will be added to the subscription receiver after this method was called.
+    pub fn unsubscribe(&mut self, topic: &str) {
+        match self.subscriptions.remove(topic) {
+            Some(cancel) => cancel.cancel(),
+            None => {}
+        }
+    }
+
+    /// Receive one of the messages in the subscription receiver with timeout.
+    pub async fn subscriptions_recv(&mut self, timeout: Duration) -> Result<Option<T>, Elapsed> {
+        time::timeout(timeout, self.subscription_receiver.recv()).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{env, sync::Once};
 
-    use tokio::time;
+    use tokio::time::{self};
     use tracing_subscriber::fmt::format::FmtSpan;
 
     use super::*;
@@ -665,5 +740,102 @@ mod tests {
                 ReceiveStatus::Received(format!("should be received {}", i).to_string())
             )
         }
+    }
+
+    #[tokio::test]
+    async fn test_send_subscribe_single_message() {
+        initialize_logger();
+        let mut connection = MessageExchange::<String>::new().run_in_background();
+        let send_connection = connection.clone();
+
+        connection.subscribe("greetings".to_string()).unwrap();
+        tokio::spawn(async move {
+            send_connection
+                .send_message_blocking("hello, world".to_string(), "greetings".to_string(), None)
+                .await;
+        });
+        assert_eq!(
+            connection
+                .subscriptions_recv(Duration::from_millis(100))
+                .await
+                .unwrap()
+                .unwrap(),
+            "hello, world".to_string()
+        );
+        connection.unsubscribe(&"greetings");
+        assert_eq!(
+            connection
+                .send_message_blocking(
+                    "hello, world".to_string(),
+                    "greetings".to_string(),
+                    Some(Duration::from_millis(10)),
+                )
+                .await,
+            BlockingSendStatus::Timeout,
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_test() {
+        let mut connection = MessageExchange::new().run_in_background();
+        async fn location_based_service(
+            connection: &MessageExchangeConnection<String>,
+            location: String,
+            user_name: String,
+        ) -> String {
+            // Check if someone was here recently.
+            let response = match connection
+                .receive_message(location.clone(), Some(Duration::from_millis(10)))
+                .await
+            {
+                ReceiveStatus::Received(previous_user_name) => {
+                    if previous_user_name != user_name {
+                        format!("{} was here.", previous_user_name)
+                    } else {
+                        "You were the last person at this location.".to_string()
+                    }
+                }
+                ReceiveStatus::InternalError => "Internal error".to_string(),
+                ReceiveStatus::Timeout => "Nobody was here recently.".to_string(),
+            };
+            // Let others know we were here.
+            connection
+                .send_message_nonblocking(user_name, location, Some(Duration::from_secs(10)))
+                .await;
+            connection
+                .send_message_nonblocking(
+                    "anonymized".to_string(),
+                    "__user_counter".to_string(),
+                    Some(Duration::from_secs(10)),
+                )
+                .await;
+            response
+        }
+        connection.subscribe("__user_counter".to_string()).unwrap();
+        // Simulate making requests in a typical Rust web framework using Connection as shared state.
+        assert_eq!(
+            location_based_service(
+                &connection,
+                "a random place".to_string(),
+                "Alice".to_string()
+            )
+            .await,
+            "Nobody was here recently."
+        );
+
+        assert_eq!(
+            location_based_service(&connection, "a random place".to_string(), "Bob".to_string())
+                .await,
+            "Alice was here."
+        );
+
+        let mut counter = 0;
+        while let Ok(Some(_)) = connection
+            .subscriptions_recv(Duration::from_millis(10))
+            .await
+        {
+            counter += 1;
+        }
+        assert_eq!(counter, 2);
     }
 }
