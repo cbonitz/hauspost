@@ -6,7 +6,7 @@ but persistence and state shared across multiple instances of a program are not 
 
 ## Usage Example
 
-In this toy example, we pass data between requests based on dynamic request attributes to create a location-based service.
+In this contrived toy example, simulate passing data between requests based on dynamic request attributes, and between requests to a background proess to create useless location-based service with a visitor counter.
 
 ```rust
 let mut connection = MessageExchange::new().run_in_background();
