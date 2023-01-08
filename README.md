@@ -9,7 +9,7 @@ but persistence and state shared across multiple instances of a program are not 
 In this toy example, we pass data between requests based on dynamic request attributes to create a location-based service.
 
 ```rust
-let connection = MessageExchange::new().run_in_background();
+let mut connection = MessageExchange::new().run_in_background();
 async fn location_based_service(
     connection: &MessageExchangeConnection<String>,
     location: String,
@@ -32,11 +32,18 @@ async fn location_based_service(
     };
     // Let others know we were here.
     connection
-        .send_message_nonblocking(user_name, location, Some(Duration::from_secs(10))
+        .send_message_nonblocking(user_name, location, Some(Duration::from_secs(10)))
+        .await;
+    connection
+        .send_message_nonblocking(
+            "anonymized".to_string(),
+            "__user_counter".to_string(),
+            Some(Duration::from_secs(10)),
+        )
         .await;
     response
 }
-
+connection.subscribe("__user_counter".to_string()).unwrap();
 // Simulate making requests in a typical Rust web framework using Connection as shared state.
 assert_eq!(
     location_based_service(
@@ -53,4 +60,13 @@ assert_eq!(
         .await,
     "Alice was here."
 );
+
+let mut counter = 0;
+while let Ok(Some(_)) = connection
+    .subscriptions_recv(Duration::from_millis(10))
+    .await
+{
+    counter += 1;
+}
+assert_eq!(counter, 2);
 ```
