@@ -48,12 +48,11 @@ where
     #[tracing::instrument(skip(self), fields(request_id = %self.id))]
     fn reply(&mut self, status: ReceiveStatus<T>) {
         if let Some(sender) = self.response_sender.0.take() {
-            match sender.send(status) {
-                Ok(_) => {}
-                Err(_) => warn!(
+            if sender.send(status).is_err() {
+                warn!(
                     message_id = self.id.to_string(),
                     "Failed to send send status",
-                ),
+                );
             }
         }
     }
@@ -123,12 +122,11 @@ where
     #[tracing::instrument(skip(self), fields(message_id = %self.id))]
     pub(crate) fn reply(&mut self, status: SendStatus) {
         if let Some(sender) = self.response_sender.0.take() {
-            match sender.send(status) {
-                Ok(_) => {}
-                Err(_) => warn!(
+            if sender.send(status).is_err() {
+                warn!(
                     message_id = self.id.to_string(),
                     "Failed to send send status",
-                ),
+                );
             }
         }
     }
