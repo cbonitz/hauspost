@@ -4,8 +4,8 @@
 //!
 //! ## Usage Example
 //!
-//! In this contrived toy example, simulate passing data between requests based on dynamic request attributes, and between requests to a background proess
-//! to create useless location-based service with a visitor counter.
+//! In this toy example shows how message passing can be used to communicate asynchronously between different request
+//! handler invocations, as well as between request handlers and a background thread.
 //! ```rust
 //! #
 //! # tokio_test::block_on(async {
