@@ -5,11 +5,11 @@ As a developer, I want to subscribe to a queue and receive messages.
 ## Implementation details
 
 - The Connection has an `mpsc` sender/receiver pair
-- A request describing a subscription is sent to the message exchange and processed in the queue
+- A request describing a subscription is sent to the message broker and processed in the queue
   - The method creating a subscription sends a copy of the sender to the queue.
   - The connection has a receive method that calls the receive method of the receiver.
 - The subscription lasts until this receiver is dropped.
-- The subscription is added to the queue like a normal `RequestReceicve`
+- The subscription is added to the queue like a normal `RequestReceive`
 - If the subscription is at the head of the queue and receives a message, it is pushed back to the end of the queue.
 
 ## Out of Scope

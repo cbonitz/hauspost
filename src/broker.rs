@@ -1,4 +1,4 @@
-//! The message exchange and its connection.
+//! The message broker and its connection.
 use anyhow::anyhow;
 use std::{cmp::min, collections::HashMap, fmt, time::Duration};
 use tokio::{
@@ -111,8 +111,8 @@ where
     Subscribe(MessageSubscription<T>),
 }
 
-/// A simple queue-based message exchange.
-pub struct MessageExchange<T>
+/// A simple queue-based message broker.
+pub struct MessageBroker<T>
 where
     T: Message,
 {
@@ -123,14 +123,14 @@ where
     tick_receiver: mpsc::UnboundedReceiver<Instant>,
 }
 
-impl<T> MessageExchange<T>
+impl<T> MessageBroker<T>
 where
     T: Message,
 {
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
     const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// Create a message exchange together with a [MessageExchangeConnection].
+    /// Create a message broker together with a [MessageBrokerConnection].
     pub fn new() -> Self {
         let (request_sender, request_receiver) = mpsc::unbounded_channel();
         let (tick_sender, tick_receiver) = mpsc::unbounded_channel();
@@ -229,10 +229,10 @@ where
         }
     }
 
-    /// Run the exchange in the background. Returns a cloneable [MessageExchangeConnection].
+    /// Run the exchange in the background. Returns a cloneable [MessageBrokerConnection].
     /// Background tasks will stop when the last clone of the connection is dropped.
     #[tracing::instrument(skip(self))]
-    pub fn run_in_background(mut self) -> MessageExchangeConnection<T> {
+    pub fn run_in_background(mut self) -> MessageBrokerConnection<T> {
         let tick_sender = self.tick_sender.clone();
         tokio::spawn(async move {
             loop {
@@ -243,7 +243,7 @@ where
                 sleep(Duration::from_millis(10)).await;
             }
         });
-        let connection = MessageExchangeConnection::new(
+        let connection = MessageBrokerConnection::new(
             self.request_sender.take().unwrap(),
             Self::DEFAULT_TIMEOUT,
             Self::MAX_TIMEOUT,
@@ -274,8 +274,8 @@ where
     }
 }
 
-/// A cloneable connection that clients can use to interact with a [MessageExchange]
-pub struct MessageExchangeConnection<T>
+/// A cloneable connection that clients can use to interact with a [MessageBroker]
+pub struct MessageBrokerConnection<T>
 where
     T: Message,
 {
@@ -287,7 +287,7 @@ where
     max_timeout: Duration,
 }
 
-impl<T> MessageExchangeConnection<T>
+impl<T> MessageBrokerConnection<T>
 where
     T: Message,
 {
@@ -308,7 +308,7 @@ where
     }
 }
 
-impl<T> Clone for MessageExchangeConnection<T>
+impl<T> Clone for MessageBrokerConnection<T>
 where
     T: Message,
 {
@@ -325,14 +325,14 @@ where
     }
 }
 
-impl<T> MessageExchangeConnection<T>
+impl<T> MessageBrokerConnection<T>
 where
     T: Message,
 {
     /// Send `message` to `topic` in a blocking fashion.
     ///
     /// The method will return when the message was delivered, the operation has timed out or an error occured and return the corresponding [BlockingSendStatus].
-    /// If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
+    /// If `timeout` is not specified, the [MessageBroker]'s default timeout will be applied.
     ///
     /// Messages from subsequent calls to this function on the same connection will be delivered in-order.
     pub async fn send_message_blocking(
@@ -350,7 +350,7 @@ where
     ///
     /// The method will return when the message was enqueued, or an error has occured doing so.
     /// After the timeout, the message will be discarded.
-    /// If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
+    /// If `timeout` is not specified, the [MessageBroker]'s default timeout will be applied.
     ///
     /// Messages from subsequent calls to this function on the same connection will be delivered in-order.
     pub async fn send_message_nonblocking(
@@ -398,7 +398,7 @@ where
         result
     }
 
-    /// Register to receive a single message from `topic`. If `timeout` is not specified, the [MessageExchange]'s default timeout will be applied.
+    /// Register to receive a single message from `topic`. If `timeout` is not specified, the [MessageBroker]'s default timeout will be applied.
     pub async fn receive_message(
         &self,
         topic: String,
@@ -488,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_receive_single_message() {
         initialize_logger();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
         let send_connection = connection.clone();
 
         tokio::spawn(async move {
@@ -508,7 +508,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_send_receive_large_amount_of_messages_sequential() {
         initialize_logger();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
         let count = 10_000;
 
         let send_connection = connection.clone();
@@ -541,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_receive_multiple_messages_with_nonblocking_send() {
         initialize_logger();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
 
         let send_connection_1 = connection.clone();
         tokio::spawn(async move {
@@ -590,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_timeout() {
         initialize_logger();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
 
         let send_result = tokio::spawn(async move {
             connection
@@ -608,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn test_receive_timeout() {
         initialize_logger();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
 
         let receive_result = tokio::spawn(async move {
             connection
@@ -622,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn test_subsequent_send_and_receive_timeouts() {
         initialize_logger();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
 
         let send_connection = connection.clone();
         let send_result = tokio::spawn(async move {
@@ -648,7 +648,7 @@ mod tests {
     async fn test_one_message_timed_out_one_message_received() {
         initialize_logger();
         time::pause();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
 
         connection
             .send_message_nonblocking(
@@ -676,7 +676,7 @@ mod tests {
     async fn test_send_timeout_many_messages_before_delivering_many() {
         initialize_logger();
         time::pause();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
         let count = 5_000;
 
         for _ in 1..count {
@@ -712,7 +712,7 @@ mod tests {
     async fn test_timed_out_messages_interleaved_with_non_timed_out_messages() {
         initialize_logger();
         time::pause();
-        let connection = MessageExchange::<String>::new().run_in_background();
+        let connection = MessageBroker::<String>::new().run_in_background();
         let count = 5_000;
 
         for i in 1..count {
@@ -745,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_subscribe_single_message() {
         initialize_logger();
-        let mut connection = MessageExchange::<String>::new().run_in_background();
+        let mut connection = MessageBroker::<String>::new().run_in_background();
         let send_connection = connection.clone();
 
         connection.subscribe("greetings".to_string()).unwrap();
@@ -777,15 +777,16 @@ mod tests {
 
     #[tokio::test]
     async fn doc_test() {
-        let mut connection = MessageExchange::new().run_in_background();
+        let mut connection = MessageBroker::new().run_in_background();
         async fn location_based_service(
-            connection: &MessageExchangeConnection<String>,
+            connection: &MessageBrokerConnection<String>,
             location: String,
             user_name: String,
         ) -> String {
             // Check if someone was here recently.
+            let location_topic = format!("__location-{}", location);
             let response = match connection
-                .receive_message(location.clone(), Some(Duration::from_millis(10)))
+                .receive_message(location_topic.clone(), Some(Duration::from_millis(10)))
                 .await
             {
                 ReceiveStatus::Received(previous_user_name) => {
@@ -800,18 +801,17 @@ mod tests {
             };
             // Let others know we were here.
             connection
-                .send_message_nonblocking(user_name, location, Some(Duration::from_secs(10)))
+                .send_message_nonblocking(user_name, location_topic, Some(Duration::from_secs(10)))
                 .await;
             connection
                 .send_message_nonblocking(
-                    "anonymized".to_string(),
-                    "__user_counter".to_string(),
+                    "".to_string(),
+                    "__recent_visitor_counter".to_string(),
                     Some(Duration::from_secs(10)),
                 )
                 .await;
             response
         }
-        connection.subscribe("__user_counter".to_string()).unwrap();
         // Simulate making requests in a typical Rust web framework using Connection as shared state.
         assert_eq!(
             location_based_service(
@@ -829,13 +829,16 @@ mod tests {
             "Alice was here."
         );
 
-        let mut counter = 0;
+        connection
+            .subscribe("__recent_visitor_counter".to_string())
+            .unwrap();
+        let mut recent_visitor_counter = 0;
         while let Ok(Some(_)) = connection
             .subscriptions_recv(Duration::from_millis(10))
             .await
         {
-            counter += 1;
+            recent_visitor_counter += 1;
         }
-        assert_eq!(counter, 2);
+        assert_eq!(recent_visitor_counter, 2);
     }
 }

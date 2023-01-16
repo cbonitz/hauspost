@@ -1,23 +1,25 @@
-# Simple In-Process Message Exchange
+# Hauspost - Simple In-Process Message Broker
 
-This is a simple topic-based in-process message exchange for use in [Tokio](https://tokio.rs/) applications.
+_Hauspost_ is a simple topic-based in-process message broker for use in [Tokio](https://tokio.rs/) applications.
 It is intended for use-cases where it is convenient to use the communication patterns provided by a message broker,
 but persistence and state shared across multiple instances of a program are not required.
 
 ## Usage Example
 
-In this contrived toy example, simulate passing data between requests based on dynamic request attributes, and between requests to a background proess to create useless location-based service with a visitor counter.
+In this toy example shows how message passing can be used to communicate asynchronously between different request
+handler invocations, as well as between request handlers and a background thread.
 
 ```rust
-let mut connection = MessageExchange::new().run_in_background();
+let mut connection = MessageBroker::new().run_in_background();
 async fn location_based_service(
-    connection: &MessageExchangeConnection<String>,
+    connection: &MessageBrokerConnection<String>,
     location: String,
     user_name: String,
 ) -> String {
     // Check if someone was here recently.
+    let location_topic = format!("__location-{}", location);
     let response = match connection
-        .receive_message(location.clone(), Some(Duration::from_millis(10)))
+        .receive_message(location_topic.clone(), Some(Duration::from_millis(10)))
         .await
     {
         ReceiveStatus::Received(previous_user_name) => {
@@ -32,18 +34,17 @@ async fn location_based_service(
     };
     // Let others know we were here.
     connection
-        .send_message_nonblocking(user_name, location, Some(Duration::from_secs(10)))
+        .send_message_nonblocking(user_name, location_topic, Some(Duration::from_secs(10)))
         .await;
     connection
         .send_message_nonblocking(
-            "anonymized".to_string(),
-            "__user_counter".to_string(),
+            "".to_string(),
+            "__recent_visitor_counter".to_string(),
             Some(Duration::from_secs(10)),
         )
         .await;
     response
 }
-connection.subscribe("__user_counter".to_string()).unwrap();
 // Simulate making requests in a typical Rust web framework using Connection as shared state.
 assert_eq!(
     location_based_service(
@@ -61,12 +62,15 @@ assert_eq!(
     "Alice was here."
 );
 
-let mut counter = 0;
+connection
+    .subscribe("__recent_visitor_counter".to_string())
+    .unwrap();
+let mut recent_visitor_counter = 0;
 while let Ok(Some(_)) = connection
     .subscriptions_recv(Duration::from_millis(10))
     .await
 {
-    counter += 1;
+    recent_visitor_counter += 1;
 }
-assert_eq!(counter, 2);
+assert_eq!(recent_visitor_counter, 2);
 ```

@@ -1,4 +1,4 @@
-//! Requests and responses used in the message exchange.
+//! Requests and responses used in the message broker.
 use debug_ignore::DebugIgnore;
 use std::time::Duration;
 use tokio::{
@@ -13,7 +13,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    exchange::{Message, ReceiveStatus, SendStatus},
+    broker::{Message, ReceiveStatus, SendStatus},
     queue::{RespondWith, RespondWithTimeout, Subscription, SubscriptionDelivery},
 };
 

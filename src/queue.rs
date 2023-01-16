@@ -137,6 +137,11 @@ where
         }
     }
 
+    fn push_back<T>(queue: &mut VecDeque<Uuid>, map: &mut HashMap<Uuid, T>, id: Uuid, request: T) {
+        queue.push_back(id.clone());
+        map.insert(id, request);
+    }
+
     fn push_front<T>(queue: &mut VecDeque<Uuid>, map: &mut HashMap<Uuid, T>, id: Uuid, request: T) {
         queue.push_front(id.clone());
         map.insert(id, request);
@@ -152,9 +157,17 @@ where
         if self.receive_request_queue.is_empty() || self.message_request_queue.is_empty() {
             return QueueStatus::Nonempty;
         }
-        let (msg_req_id, mut send_message) =
+        while let Some((msg_req_id, send_message)) =
             Self::pop_front(&mut self.message_request_queue, &mut self.message_requests)
-                .expect("Requests cannot be empty at this point");
+        {
+            if !self.try_find_receiver(send_message, msg_req_id) {
+                break;
+            }
+        }
+        self.remove_requests_without_id()
+    }
+
+    fn try_find_receiver(&mut self, mut send_message: Msg, msg_req_id: Uuid) -> bool {
         loop {
             match Self::pop_front(&mut self.receive_request_queue, &mut self.receive_requests) {
                 Some((request_id, request)) => {
@@ -162,13 +175,13 @@ where
                         QueueItem::Subscription(mut subscription) => {
                             match subscription.try_deliver(send_message) {
                                 SubscriptionDelivery::DeliveryAccepted => {
-                                    Self::push_front(
+                                    Self::push_back(
                                         &mut self.receive_request_queue,
                                         &mut self.receive_requests,
                                         request_id,
                                         QueueItem::Subscription(subscription),
                                     );
-                                    break;
+                                    return true;
                                 }
                                 SubscriptionDelivery::ExpiredSubscriptionCannotDeliver(message) => {
                                     send_message = message
@@ -177,7 +190,7 @@ where
                         }
                         QueueItem::RequestSingleReceive(request) => {
                             request.respond_with(send_message);
-                            break;
+                            return true;
                         }
                     };
                 }
@@ -188,12 +201,10 @@ where
                         msg_req_id,
                         send_message,
                     );
-                    break;
+                    return false;
                 }
             }
         }
-
-        self.remove_requests_without_id()
     }
 
     /// Process potential timeouts at instant `now`.
@@ -276,7 +287,7 @@ where
 mod tests {
     use super::{Queue, QueueStatus};
     use crate::{
-        exchange::{Message, ReceiveStatus, SendStatus},
+        broker::{Message, ReceiveStatus, SendStatus},
         requests::{MessageSubscription, RequestReceive, RequestSend, TimeoutStamp},
     };
     use distinct_permutations::distinct_permutations;
