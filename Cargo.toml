@@ -21,4 +21,9 @@ tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-test = "0.4.2"
 itertools = "0"
-distinct_permutations = { git="https://github.com/cbonitz/distinct_permutations.git", branch="v0.0.1" }
+distinct_permutations = { git = "https://github.com/cbonitz/distinct_permutations.git", branch = "v0.0.1" }
+criterion = { version = "0.4", features = ["async_tokio"] }
+
+[[bench]]
+name = "message_benchmark"
+harness = false

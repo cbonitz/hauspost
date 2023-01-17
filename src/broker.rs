@@ -1,6 +1,11 @@
 //! The message broker and its connection.
 use anyhow::anyhow;
-use std::{cmp::min, collections::HashMap, fmt, time::Duration};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    fmt::{self, Display},
+    time::Duration,
+};
 use tokio::{
     sync::mpsc,
     time::{self, error::Elapsed, sleep, Instant},
@@ -285,6 +290,15 @@ where
     subscriptions: HashMap<String, CancellationToken>,
     default_timeout: Duration,
     max_timeout: Duration,
+}
+
+impl<T> Display for MessageBrokerConnection<T>
+where
+    T: Message,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MessageBrokerConnection")
+    }
 }
 
 impl<T> MessageBrokerConnection<T>
