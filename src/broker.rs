@@ -1,5 +1,6 @@
 //! The message broker and its connection.
 use anyhow::anyhow;
+use core::panic;
 use std::{
     cmp::min,
     collections::HashMap,
@@ -34,6 +35,28 @@ where
     InternalError,
     /// The message request has timed out.
     Timeout,
+}
+
+impl<T> From<ReceiveStatus<T>> for Option<T>
+where
+    T: Message,
+{
+    fn from(value: ReceiveStatus<T>) -> Self {
+        match value {
+            ReceiveStatus::Received(t) => Some(t),
+            ReceiveStatus::InternalError => None,
+            ReceiveStatus::Timeout => None,
+        }
+    }
+}
+
+impl<T> ReceiveStatus<T>
+where
+    T: Message,
+{
+    pub fn ok(self) -> Option<T> {
+        self.into()
+    }
 }
 
 impl<T> fmt::Debug for ReceiveStatus<T>
@@ -448,6 +471,11 @@ where
         result
     }
 
+    /// Receive a single message from `topic` if immediately available.
+    pub async fn peek_message(&self, topic: String) -> ReceiveStatus<T> {
+        self.receive_message(topic, Some(Duration::default())).await
+    }
+
     /// Subscribe to topic. Messages will be received via an [`mpsc::UnboundedReceiver`] as long as the subscription is active.
     /// To consume the messages, call `subscriptions_recv`.
     ///
@@ -514,8 +542,29 @@ mod tests {
         assert_eq!(
             connection
                 .receive_message("greetings".to_string(), None)
-                .await,
-            ReceiveStatus::Received("hello, world".to_string())
+                .await
+                .ok()
+                .unwrap(),
+            "hello, world"
+        )
+    }
+
+    #[tokio::test]
+    async fn test_send_peek_single_message() {
+        initialize_logger();
+        let connection = MessageBroker::<String>::new().run_in_background();
+
+        connection
+            .send_message_nonblocking("hello, world".to_string(), "greetings".to_string(), None)
+            .await;
+
+        assert_eq!(
+            connection
+                .peek_message("greetings".to_string())
+                .await
+                .ok()
+                .unwrap(),
+            "hello, world"
         )
     }
 
@@ -546,8 +595,10 @@ mod tests {
                         format!("messages {}", i % 10),
                         Some(Duration::from_secs(15)),
                     )
-                    .await,
-                ReceiveStatus::Received(format!("message {}", i))
+                    .await
+                    .ok()
+                    .unwrap(),
+                format!("message {}", i)
             )
         }
     }
@@ -799,10 +850,7 @@ mod tests {
         ) -> String {
             // Check if someone was here recently.
             let location_topic = format!("__location-{}", location);
-            let response = match connection
-                .receive_message(location_topic.clone(), Some(Duration::from_millis(10)))
-                .await
-            {
+            let response = match connection.peek_message(location_topic.clone()).await {
                 ReceiveStatus::Received(previous_user_name) => {
                     if previous_user_name != user_name {
                         format!("{} was here.", previous_user_name)
@@ -847,10 +895,7 @@ mod tests {
             .subscribe("__recent_visitor_counter".to_string())
             .unwrap();
         let mut recent_visitor_counter = 0;
-        while let Ok(Some(_)) = connection
-            .subscriptions_recv(Duration::from_millis(10))
-            .await
-        {
+        while let Ok(Some(_)) = connection.subscriptions_recv(Duration::default()).await {
             recent_visitor_counter += 1;
         }
         assert_eq!(recent_visitor_counter, 2);

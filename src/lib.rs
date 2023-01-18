@@ -19,10 +19,7 @@
 //! ) -> String {
 //!     // Check if someone was here recently.
 //!     let location_topic = format!("__location-{}", location);
-//!     let response = match connection
-//!         .receive_message(location_topic.clone(), Some(Duration::from_millis(10)))
-//!         .await
-//!     {
+//!     let response = match connection.peek_message(location_topic.clone()).await {
 //!         ReceiveStatus::Received(previous_user_name) => {
 //!             if previous_user_name != user_name {
 //!                 format!("{} was here.", previous_user_name)
@@ -67,10 +64,7 @@
 //!     .subscribe("__recent_visitor_counter".to_string())
 //!     .unwrap();
 //! let mut recent_visitor_counter = 0;
-//! while let Ok(Some(_)) = connection
-//!     .subscriptions_recv(Duration::from_millis(10))
-//!     .await
-//! {
+//! while let Ok(Some(_)) = connection.subscriptions_recv(Duration::default()).await {
 //!     recent_visitor_counter += 1;
 //! }
 //! assert_eq!(recent_visitor_counter, 2);

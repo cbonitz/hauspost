@@ -1,7 +1,8 @@
+use core::panic;
 use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use hauspost::broker::MessageBroker;
+use hauspost::broker::{MessageBroker, ReceiveStatus};
 use tokio::runtime::Runtime;
 
 async fn bench_send_receive_subsequent(count: usize) {
@@ -11,14 +12,17 @@ async fn bench_send_receive_subsequent(count: usize) {
             .send_message_nonblocking(
                 "message".to_string(),
                 "topic".to_string(),
-                Some(Duration::from_secs(3)),
+                Some(Duration::from_secs(10)),
             )
             .await;
     }
 
-    // Receive must be in-order within topic
+    // Since all messages have been sent, peek must return all messages
     for _ in 1..count {
-        connection.receive_message("topic".to_string(), None).await;
+        match connection.peek_message("topic".to_string()).await {
+            ReceiveStatus::Received(_) => {}
+            _ => panic!("expected to receive"),
+        };
     }
 }
 
@@ -37,9 +41,12 @@ async fn bench_send_receive_blocking(count: usize) {
         }
     });
 
-    // Receive must be in-order within topic
+    // All messages must be received eventually
     for _ in 1..count {
-        connection.receive_message("topic".to_string(), None).await;
+        match connection.receive_message("topic".to_string(), None).await {
+            ReceiveStatus::Received(_) => {}
+            _ => panic!("expected to receive"),
+        };
     }
 }
 
