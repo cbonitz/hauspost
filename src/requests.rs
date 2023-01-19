@@ -19,13 +19,13 @@ use crate::{
 
 /// Request to receive a message.
 #[derive(Debug)]
-pub struct RequestReceive<T>
+pub(crate) struct RequestReceive<T>
 where
     T: Message,
 {
-    pub id: Uuid,
-    pub queue: String,
-    pub timeout: TimeoutStamp,
+    pub(crate) id: Uuid,
+    pub(crate) queue: String,
+    pub(crate) timeout: TimeoutStamp,
     pub(crate) response_sender: DebugIgnore<Option<oneshot::Sender<ReceiveStatus<T>>>>,
 }
 
@@ -33,7 +33,7 @@ impl<T> RequestReceive<T>
 where
     T: Message,
 {
-    pub fn new(queue: String, timeout: TimeoutStamp) -> (Receiver<ReceiveStatus<T>>, Self) {
+    pub(crate) fn new(queue: String, timeout: TimeoutStamp) -> (Receiver<ReceiveStatus<T>>, Self) {
         let (response_sender, receiver) = oneshot::channel();
         let id = Uuid::new_v4();
         let request = Self {
@@ -80,13 +80,13 @@ where
 
 /// Request to send a message.
 #[derive(Debug)]
-pub struct RequestSend<T>
+pub(crate) struct RequestSend<T>
 where
     T: Message,
 {
-    pub id: Uuid,
-    pub queue: String,
-    pub timeout: TimeoutStamp,
+    pub(crate) id: Uuid,
+    pub(crate) queue: String,
+    pub(crate) timeout: TimeoutStamp,
     pub(crate) response_sender: DebugIgnore<Option<oneshot::Sender<SendStatus>>>,
     message: DebugIgnore<Option<T>>,
 }
@@ -172,12 +172,12 @@ where
 }
 
 #[derive(Debug)]
-pub struct MessageSubscription<T>
+pub(crate) struct MessageSubscription<T>
 where
     T: Message,
 {
-    pub id: Uuid,
-    pub queue: String,
+    pub(crate) id: Uuid,
+    pub(crate) queue: String,
     sender: UnboundedSender<T>,
     cancellation_token: CancellationToken,
 }
@@ -221,9 +221,9 @@ where
 
 /// Encapsulates information to process and trace timeouts.
 #[derive(Debug)]
-pub struct TimeoutStamp {
-    pub timeout_at: Instant,
-    pub created_at: Instant,
+pub(crate) struct TimeoutStamp {
+    pub(crate) timeout_at: Instant,
+    pub(crate) created_at: Instant,
 }
 
 impl TimeoutStamp {

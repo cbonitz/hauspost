@@ -9,7 +9,8 @@
 //! ```rust
 //! #
 //! # tokio_test::block_on(async {
-//! # use hauspost::broker::{MessageBroker, MessageBrokerConnection, ReceiveStatus};
+//! # use hauspost::broker::{MessageBroker, ReceiveStatus};
+//! # use hauspost::connection::{MessageBrokerConnection};
 //! # use tokio::time::Duration;
 //! let mut connection = MessageBroker::new().run_in_background();
 //! async fn location_based_service(
@@ -71,5 +72,6 @@
 //! # });
 //! ```
 pub mod broker;
+pub mod connection;
 pub mod queue;
-pub mod requests;
+pub(crate) mod requests;

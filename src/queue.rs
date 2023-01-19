@@ -138,12 +138,12 @@ where
     }
 
     fn push_back<T>(queue: &mut VecDeque<Uuid>, map: &mut HashMap<Uuid, T>, id: Uuid, request: T) {
-        queue.push_back(id.clone());
+        queue.push_back(id);
         map.insert(id, request);
     }
 
     fn push_front<T>(queue: &mut VecDeque<Uuid>, map: &mut HashMap<Uuid, T>, id: Uuid, request: T) {
-        queue.push_front(id.clone());
+        queue.push_front(id);
         map.insert(id, request);
     }
 
@@ -255,9 +255,9 @@ where
         id: Uuid,
         timeout_at: Instant,
     ) -> QueueStatus {
-        self.receive_request_queue.push_back(id.clone());
+        self.receive_request_queue.push_back(id);
         self.receive_request_timeouts
-            .push(Reverse((timeout_at, id.clone())));
+            .push(Reverse((timeout_at, id)));
         self.receive_requests
             .insert(id, QueueItem::RequestSingleReceive(receive_request));
         self.make_match()
@@ -266,9 +266,9 @@ where
     /// Process a message request.
     #[tracing::instrument(skip(self, message_request), fields(queue=self.name, msg_req_id=%id))]
     pub fn send(&mut self, message_request: Msg, id: Uuid, timeout_at: Instant) -> QueueStatus {
-        self.message_request_queue.push_back(id.clone());
+        self.message_request_queue.push_back(id);
         self.message_request_timeouts
-            .push(Reverse((timeout_at, id.clone())));
+            .push(Reverse((timeout_at, id)));
         self.message_requests.insert(id, message_request);
         self.make_match()
     }
@@ -276,7 +276,7 @@ where
     /// Process a subscription.
     #[tracing::instrument(skip(self, subscription), fields(queue=self.name, msg_req_id=%id))]
     pub fn subscribe(&mut self, subscription: Subscription, id: Uuid) -> QueueStatus {
-        self.receive_request_queue.push_back(id.clone());
+        self.receive_request_queue.push_back(id);
         self.receive_requests
             .insert(id, QueueItem::Subscription(subscription));
         self.make_match()
@@ -324,13 +324,13 @@ mod tests {
     fn receive() -> (oneshot::Receiver<ReceiveStatus<u64>>, RequestReceive<u64>) {
         RequestReceive::new(
             DEFAULT_QUEUE_NAME.to_string(),
-            TimeoutStamp::new(TIMEOUT.clone()),
+            TimeoutStamp::new(TIMEOUT),
         )
     }
     fn send(message: u64) -> (oneshot::Receiver<SendStatus>, RequestSend<u64>) {
         let (receiver, request) = RequestSend::new(
             DEFAULT_QUEUE_NAME.to_string(),
-            TimeoutStamp::new(TIMEOUT.clone()),
+            TimeoutStamp::new(TIMEOUT),
             message,
             true,
         );
@@ -342,14 +342,14 @@ mod tests {
         T: Message,
     {
         pub fn send_receive_request(&mut self, request: RequestReceive<T>) -> QueueStatus {
-            let timeout_at = request.timeout.timeout_at.clone();
-            let send_id = request.id.clone();
+            let timeout_at = request.timeout.timeout_at;
+            let send_id = request.id;
             self.receive(request, send_id, timeout_at)
         }
 
         pub fn send_send_request(&mut self, request: RequestSend<T>) -> QueueStatus {
-            let timeout_at = request.timeout.timeout_at.clone();
-            let send_id = request.id.clone();
+            let timeout_at = request.timeout.timeout_at;
+            let send_id = request.id;
             self.send(request, send_id, timeout_at)
         }
 
@@ -357,7 +357,7 @@ mod tests {
             &mut self,
             subscription: MessageSubscription<T>,
         ) -> QueueStatus {
-            let subscription_id = subscription.id.clone();
+            let subscription_id = subscription.id;
             self.subscribe(subscription, subscription_id)
         }
     }
