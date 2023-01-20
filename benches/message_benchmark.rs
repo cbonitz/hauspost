@@ -53,7 +53,9 @@ async fn bench_send_receive_blocking(count: usize) {
 pub fn criterion_benchmark(c: &mut Criterion) {
     let size: usize = 10_000;
     let rt = Runtime::new().unwrap();
-    c.bench_with_input(
+    let mut g = c.benchmark_group("throughput");
+    g.throughput(criterion::Throughput::Elements(size as u64));
+    g.bench_with_input(
         BenchmarkId::new("nonblocking send then receive", size),
         &size,
         |b, &s| {
@@ -61,7 +63,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 .iter(|| bench_send_receive_subsequent(black_box(s)));
         },
     );
-    c.bench_with_input(
+    g.bench_with_input(
         BenchmarkId::new("blocking send in separate thread", size),
         &size,
         |b, &s| {
@@ -69,6 +71,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 .iter(|| bench_send_receive_blocking(black_box(s)));
         },
     );
+    g.finish();
 }
 
 criterion_group!(benches, criterion_benchmark);
